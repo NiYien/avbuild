@@ -43,11 +43,15 @@ jobs:
       shell: bash
       run: |
         set -euo pipefail
+        exec > >(tee verification.txt) 2>&1
+        set -x
         libs=(sdk-*/lib/libavcodec.a)
         test "${#libs[@]}" -eq 1
         lib=${libs[0]}
-        lipo -verify_arch x86_64 arm64 "$lib"
+        lipo -info "$lib"
+        archs=" $(lipo -archs "$lib") "
         for arch in x86_64 arm64; do
+          test "${archs#* $arch }" != "$archs"
           nm -arch "$arch" "$lib" > "nm-${arch}.txt"
           for codec in h264 hevc prores; do
             symbol="_ff_${codec}_videotoolbox_encoder"
@@ -56,7 +60,12 @@ jobs:
           done
         done
         for dependency in x264 x265; do
-          lipo -verify_arch x86_64 arm64 "tools/dep_gpl/${TARGET_OS}/lib/lib${dependency}.a"
+          dependency_lib="tools/dep_gpl/${TARGET_OS}/lib/lib${dependency}.a"
+          lipo -info "$dependency_lib"
+          dependency_archs=" $(lipo -archs "$dependency_lib") "
+          for arch in x86_64 arm64; do
+            test "${dependency_archs#* $arch }" != "$dependency_archs"
+          done
         done
 
     - name: Package SDK
@@ -85,5 +94,6 @@ jobs:
         path: |
           sdk-*/config*.log
           nm-*.txt
+          verification.txt
         if-no-files-found: ignore
         retention-days: 7
