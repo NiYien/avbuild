@@ -14,7 +14,7 @@ concurrency:
 
 env:
   FF_VERSION: '8.1'
-  FF_COMMIT: 'n8.1.2'
+  FF_COMMIT: 'n8.1.3'
   TARGET_OS: macOS
   CONFIG_SUFFIX: -gpl-lite
   NINJA_STATUS: '[%f/%t %e %r]'
@@ -38,6 +38,12 @@ jobs:
       run: |
         export FFSRC=$PWD/ffmpeg-${FF_VERSION}
         ./avbuild.sh macOS10.15
+
+    - name: Verify VideoToolbox color ownership fix
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 tools/verify-videotoolbox-color-fix.py "ffmpeg-${FF_VERSION}"
 
     - name: Verify universal libraries and VideoToolbox encoders
       shell: bash
@@ -68,6 +74,18 @@ jobs:
           done
         done
 
+    - name: Exercise repeated VideoToolbox sessions on macOS
+      shell: bash
+      run: |
+        set -euo pipefail
+        sdk=$(echo sdk-*)
+        clang tools/test-videotoolbox-reopen.c -I"$sdk/include" \
+          "$sdk/lib/libavcodec.dylib" "$sdk/lib/libavutil.dylib" \
+          -framework CoreFoundation -framework CoreVideo \
+          -Wl,-rpath,"$PWD/$sdk/lib" -o test-videotoolbox-reopen
+        DYLD_LIBRARY_PATH="$PWD/$sdk/lib" MallocScribble=1 \
+          ./test-videotoolbox-reopen 2>&1 | tee videotoolbox-reopen.txt
+
     - name: Package SDK
       shell: bash
       run: |
@@ -83,6 +101,8 @@ jobs:
         path: |
           ffmpeg-*.tar.xz
           SHA256SUMS.txt
+          verification.txt
+          videotoolbox-reopen.txt
         if-no-files-found: error
         retention-days: 30
 
@@ -95,5 +115,6 @@ jobs:
           sdk-*/config*.log
           nm-*.txt
           verification.txt
+          videotoolbox-reopen.txt
         if-no-files-found: ignore
         retention-days: 7
