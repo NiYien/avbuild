@@ -1,0 +1,125 @@
+name: Build Gyroflow FFmpeg Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/hevc-tile-interleave]
+    paths:
+      - .github/workflows/build_gyroflow_ffmpeg_windows.yml
+      - patches/8.1/**
+      - tools/verify-hevc-tile-sdk.py
+      - tools/gyroflow-windows-features.json
+      - config-gyroflow-windows.sh
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gyroflow-ffmpeg-windows-hevc-tiles
+  cancel-in-progress: false
+
+env:
+  FF_VERSION: '8.1'
+  FF_COMMIT: '9047fa1b084f76b1b4d065af2d743df1b40dfb56'
+  CONFIG_SUFFIX: -gpl-lite
+  SDK_NAME: ffmpeg-8.1-windows-x64-hevc-tiles-v1
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          path-type: inherit
+          install: make diffutils patch pkgconf nasm yasm
+
+      - name: Prepare FFmpeg and codec dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --depth 1 --branch n8.1 https://github.com/FFmpeg/FFmpeg.git ffmpeg-8.1
+          if ($LASTEXITCODE -ne 0) { throw 'FFmpeg checkout failed' }
+          $commit = git -C ffmpeg-8.1 rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $commit.Trim() -ne $env:FF_COMMIT) { throw 'Unexpected FFmpeg source revision' }
+          foreach ($name in @('dep', 'dep_gpl')) {
+            curl.exe -fL --retry 3 --connect-timeout 30 --max-time 600 -o "$name.7z" "https://master.dl.sourceforge.net/project/avbuild/dep/$name.7z?viasf=1"
+            if ($LASTEXITCODE -ne 0) { throw "Failed to download $name" }
+            7z x -y "$name.7z" -otools
+            if ($LASTEXITCODE -ne 0) { throw "Failed to extract $name" }
+          }
+          Get-FileHash dep.7z,dep_gpl.7z -Algorithm SHA256 | Format-List | Out-File dependency-hashes.txt
+          curl.exe -fL --retry 3 --connect-timeout 30 --max-time 600 -o libmdk-dep.zip https://nightly.link/wang-bin/devpkgs/workflows/build/main/libmdk-dep.zip
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download current hardware codec dependencies' }
+          7z x -y libmdk-dep.zip -otools/dependency-overlay
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to extract dependency overlay' }
+          7z x -y tools/dependency-overlay/dep-av.7z -otools/dependency-overlay
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to extract hardware codec dependencies' }
+          Copy-Item -Path tools/dependency-overlay/dep-av/* -Destination tools/dep -Recurse -Force
+          Get-FileHash libmdk-dep.zip -Algorithm SHA256 | Format-List | Out-File dependency-hashes.txt -Append
+          Copy-Item config-gyroflow-windows.sh config.sh
+
+      - name: Build Windows GPL-lite SDK
+        shell: msys2 {0}
+        env:
+          VC_BUILD: 'true'
+          VS_CL: vs2022
+          Platform: x64
+          VSLANG: '1033'
+        run: |
+          set -euo pipefail
+          export FFSRC="$PWD/ffmpeg-8.1"
+          printf '%s\n' '8.1-niyien-hevc-tiles-v1' > "$FFSRC/FF_VERSION"
+          ./avbuild.sh windows-desktop x64
+
+      - name: Verify and package SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = (Resolve-Path -LiteralPath $env:GITHUB_WORKSPACE).Path
+          $sdks = @(Get-ChildItem -LiteralPath $root -Directory -Filter 'sdk-*')
+          if ($sdks.Count -ne 1) { throw 'Expected one SDK directory' }
+          $source = $sdks[0].FullName
+          $target = [IO.Path]::GetFullPath((Join-Path $root $env:SDK_NAME))
+          if (-not $source.StartsWith($root + [IO.Path]::DirectorySeparatorChar) -or -not $target.StartsWith($root + [IO.Path]::DirectorySeparatorChar)) { throw 'SDK path escaped workspace' }
+          Move-Item -LiteralPath $source -Destination $target
+          python tools/verify-hevc-tile-sdk.py $target
+          if ($LASTEXITCODE -ne 0) { throw 'SDK verification failed' }
+          Copy-Item dependency-hashes.txt,verification.json -Destination $target
+          Copy-Item patches/8.1/0038-hevc-tile-row-order.patch -Destination $target
+          Copy-Item ffmpeg-8.1/COPYING.GPLv2 -Destination $target
+          7z a -t7z -mx=7 "$env:SDK_NAME.7z" $env:SDK_NAME
+          if ($LASTEXITCODE -ne 0) { throw 'SDK packaging failed' }
+          $hash = (Get-FileHash -LiteralPath "$env:SDK_NAME.7z" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $env:SDK_NAME.7z" | Set-Content SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-8.1-windows-x64-hevc-tiles-v1
+          path: |
+            ffmpeg-8.1-windows-x64-hevc-tiles-v1.7z
+            SHA256SUMS.txt
+            verification.json
+            dependency-hashes.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ffmpeg-windows-diagnostics
+          path: |
+            build_*/ffbuild/config.log
+            build_*/config*.txt
+            sdk-*/config*.log
+            verification.json
+          if-no-files-found: ignore

@@ -1,0 +1,2610 @@
+Subject: [PATCH] hevc: interleave tile rows on FFmpeg 8.1
+
+Backport of FFmpeg PR #24288 by YoungSoo Lee, revision
+52ac05875001327cef8e29ef8bf52c262e434c5c, onto n8.1
+9047fa1b084f76b1b4d065af2d743df1b40dfb56.
+
+Keep the 8.1 CABAC bypass implementation and separate weighted-prediction
+offset arguments. Retain the upstream filtering and ENOMEM corrections.
+Upstream: https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24288
+
+diff --git a/doc/decoders.texi b/doc/decoders.texi
+index 1db297f42f664aeba05295384f06b853b0cb19ce..f6a2b33bc4400c50ad1cb27754c73db97e69f1d6 100644
+--- a/doc/decoders.texi
++++ b/doc/decoders.texi
+@@ -81,6 +81,20 @@ the corresponding elements of @option{view_ids_available}, i.e.
+ Same validity restrictions as for @option{view_ids_available} apply to
+ this option.
+ 
++@item tile_interleave
++Decode pictures split into tile columns in CTB row order rather than in tile
++scan order, so that frame threading keeps overlapping. With the tile scan the
++lower CTB rows are published only once the last tile column has been decoded,
++which stalls the frames waiting for them. Only the order in which the CTBs are
++decoded changes, the output is the same.
++
++The default of -1 takes this order for eligible pictures when frame threading is
++in use, 0 disables it, and 1 takes it for eligible pictures even without frame
++threading. A picture is eligible when it has two or more tile columns, does not
++use entropy coding synchronization and packs its tiles into slices in a layout
++the traversal supports. Every other picture is decoded in tile scan order as
++before.
++
+ @end table
+ 
+ @section rawvideo
+diff --git a/libavcodec/hevc/cabac.c b/libavcodec/hevc/cabac.c
+index 55d5741f87543fddf10b06ad51a134b4f2ff6f4f..3d12ad2845e25e788a42bd39341027c712b363af 100644
+--- a/libavcodec/hevc/cabac.c
++++ b/libavcodec/hevc/cabac.c
+@@ -407,84 +407,104 @@ void ff_hevc_save_states(HEVCLocalContext *lc, const HEVCPPS *pps,
+         (ctb_addr_ts % sps->ctb_width == 2 ||
+          (sps->ctb_width == 2 &&
+           ctb_addr_ts % sps->ctb_width == 0))) {
+-        memcpy(lc->common_cabac_state->state, lc->cabac_state, HEVC_CONTEXTS);
++        memcpy(lc->common_cabac_state->state, lc->sub.cabac_state, HEVC_CONTEXTS);
+         if (sps->persistent_rice_adaptation_enabled) {
+-            memcpy(lc->common_cabac_state->stat_coeff, lc->stat_coeff, HEVC_STAT_COEFFS);
++            memcpy(lc->common_cabac_state->stat_coeff, lc->sub.stat_coeff, HEVC_STAT_COEFFS);
+         }
+     }
+ }
+ 
+ static void load_states(HEVCLocalContext *lc, const HEVCSPS *sps)
+ {
+-    memcpy(lc->cabac_state, lc->common_cabac_state->state, HEVC_CONTEXTS);
++    memcpy(lc->sub.cabac_state, lc->common_cabac_state->state, HEVC_CONTEXTS);
+     if (sps->persistent_rice_adaptation_enabled) {
+-        memcpy(lc->stat_coeff, lc->common_cabac_state->stat_coeff, HEVC_STAT_COEFFS);
++        memcpy(lc->sub.stat_coeff, lc->common_cabac_state->stat_coeff, HEVC_STAT_COEFFS);
+     }
+ }
+ 
+ static int cabac_reinit(HEVCLocalContext *lc)
+ {
+-    return skip_bytes(&lc->cc, 0) == NULL ? AVERROR_INVALIDDATA : 0;
++    return skip_bytes(&lc->sub.cc, 0) == NULL ? AVERROR_INVALIDDATA : 0;
+ }
+ 
+ static void cabac_init_state(HEVCLocalContext *lc, const HEVCContext *s)
+ {
+-    int init_type = 2 - s->sh.slice_type;
++    int init_type = 2 - lc->sh->slice_type;
+     int i;
+ 
+-    if (s->sh.cabac_init_flag && s->sh.slice_type != HEVC_SLICE_I)
++    if (lc->sh->cabac_init_flag && lc->sh->slice_type != HEVC_SLICE_I)
+         init_type ^= 3;
+ 
+     for (i = 0; i < HEVC_CONTEXTS; i++) {
+         int init_value = init_values[init_type][i];
+         int m = (init_value >> 4) * 5 - 45;
+         int n = ((init_value & 15) << 3) - 16;
+-        int pre = 2 * (((m * av_clip(s->sh.slice_qp, 0, 51)) >> 4) + n) - 127;
++        int pre = 2 * (((m * av_clip(lc->sh->slice_qp, 0, 51)) >> 4) + n) - 127;
+ 
+         pre ^= pre >> 31;
+         if (pre > 124)
+             pre = 124 + (pre & 1);
+-        lc->cabac_state[i] = pre;
++        lc->sub.cabac_state[i] = pre;
+     }
+ 
+     for (i = 0; i < 4; i++)
+-        lc->stat_coeff[i] = 0;
++        lc->sub.stat_coeff[i] = 0;
++}
++
++/* Continue CABAC across a substream boundary. If it is not open yet, open it
++ * on this substream's own data; if it is already open, continue reading
++ * byte-aligned inside the same buffer. Open means the serial traversal is
++ * reading one slice from a single buffer, not open means every substream has
++ * its own buffer (tiles in row-major traversal, rows in WPP threads). The
++ * distinction the former is_wpp argument made now lives in opened. */
++static int substream_continue(HEVCLocalContext *lc)
++{
++    HEVCSubstream *const sub = &lc->sub;
++    int ret;
++
++    if (sub->opened)
++        return cabac_reinit(lc);
++
++    ret = ff_init_cabac_decoder(&sub->cc, sub->data, sub->size);
++    if (ret < 0)
++        return ret;
++    sub->opened = 1;
++
++    return 0;
+ }
+ 
+ int ff_hevc_cabac_init(HEVCLocalContext *lc, const HEVCPPS *pps,
+-                       int ctb_addr_ts, const uint8_t *data, size_t size,
+-                       int is_wpp)
++                       int ctb_addr_ts)
+ {
+     const HEVCContext *const s = lc->parent;
+     const HEVCSPS   *const sps = pps->sps;
++    HEVCSubstream *const sub = &lc->sub;
+ 
+-    if (ctb_addr_ts == pps->ctb_addr_rs_to_ts[s->sh.slice_ctb_addr_rs]) {
+-        int ret = ff_init_cabac_decoder(&lc->cc, data, size);
++    if (ctb_addr_ts == pps->ctb_addr_rs_to_ts[lc->sh->slice_ctb_addr_rs]) {
++        /* First CTB of a slice segment. For a dependent slice segment the
++         * data still belongs to the new segment. */
++        int ret = ff_init_cabac_decoder(&sub->cc, sub->data, sub->size);
+         if (ret < 0)
+             return ret;
+-        if (s->sh.dependent_slice_segment_flag == 0 ||
++        sub->opened = 1;
++        if (lc->sh->dependent_slice_segment_flag == 0 ||
+             (pps->tiles_enabled_flag &&
+              pps->tile_id[ctb_addr_ts] != pps->tile_id[ctb_addr_ts - 1]))
+             cabac_init_state(lc, s);
+ 
+-        if (!s->sh.first_slice_in_pic_flag &&
++        if (!lc->sh->first_slice_in_pic_flag &&
+             pps->entropy_coding_sync_enabled_flag) {
+             if (ctb_addr_ts % sps->ctb_width == 0) {
+                 if (sps->ctb_width == 1)
+                     cabac_init_state(lc, s);
+-                else if (s->sh.dependent_slice_segment_flag == 1)
++                else if (lc->sh->dependent_slice_segment_flag == 1)
+                     load_states(lc, sps);
+             }
+         }
+     } else {
+         if (pps->tiles_enabled_flag &&
+             pps->tile_id[ctb_addr_ts] != pps->tile_id[ctb_addr_ts - 1]) {
+-            int ret;
+-            if (!is_wpp)
+-                ret = cabac_reinit(lc);
+-            else {
+-                ret = ff_init_cabac_decoder(&lc->cc, data, size);
+-            }
++            int ret = substream_continue(lc);
+             if (ret < 0)
+                 return ret;
+             cabac_init_state(lc, s);
+@@ -492,12 +512,13 @@ int ff_hevc_cabac_init(HEVCLocalContext *lc, const HEVCPPS *pps,
+         if (pps->entropy_coding_sync_enabled_flag) {
+             if (ctb_addr_ts % sps->ctb_width == 0) {
+                 int ret;
+-                get_cabac_terminate(&lc->cc);
+-                if (!is_wpp)
+-                    ret = cabac_reinit(lc);
+-                else {
+-                    ret = ff_init_cabac_decoder(&lc->cc, data, size);
+-                }
++                /* The terminate bit at the end of a row is only consumed
++                 * when an already open buffer is continued. Consuming it
++                 * from a buffer that is about to be opened discarded the
++                 * value anyway. */
++                if (sub->opened)
++                    get_cabac_terminate(&sub->cc);
++                ret = substream_continue(lc);
+                 if (ret < 0)
+                     return ret;
+ 
+@@ -511,7 +532,7 @@ int ff_hevc_cabac_init(HEVCLocalContext *lc, const HEVCPPS *pps,
+     return 0;
+ }
+ 
+-#define GET_CABAC(ctx)  get_cabac(&lc->cc, &lc->cabac_state[ctx])
++#define GET_CABAC(ctx)  get_cabac(&lc->sub.cc, &lc->sub.cabac_state[ctx])
+ 
+ int ff_hevc_sao_merge_flag_decode(HEVCLocalContext *lc)
+ {
+@@ -523,7 +544,7 @@ int ff_hevc_sao_type_idx_decode(HEVCLocalContext *lc)
+     if (!GET_CABAC(SAO_TYPE_IDX_OFFSET))
+         return 0;
+ 
+-    if (!get_cabac_bypass(&lc->cc))
++    if (!get_cabac_bypass(&lc->sub.cc))
+         return SAO_BAND;
+     return SAO_EDGE;
+ }
+@@ -531,10 +552,10 @@ int ff_hevc_sao_type_idx_decode(HEVCLocalContext *lc)
+ int ff_hevc_sao_band_position_decode(HEVCLocalContext *lc)
+ {
+     int i;
+-    int value = get_cabac_bypass(&lc->cc);
++    int value = get_cabac_bypass(&lc->sub.cc);
+ 
+     for (i = 0; i < 4; i++)
+-        value = (value << 1) | get_cabac_bypass(&lc->cc);
++        value = (value << 1) | get_cabac_bypass(&lc->sub.cc);
+     return value;
+ }
+ 
+@@ -543,26 +564,26 @@ int ff_hevc_sao_offset_abs_decode(HEVCLocalContext *lc, int bit_depth)
+     int i = 0;
+     int length = (1 << (FFMIN(bit_depth, 10) - 5)) - 1;
+ 
+-    while (i < length && get_cabac_bypass(&lc->cc))
++    while (i < length && get_cabac_bypass(&lc->sub.cc))
+         i++;
+     return i;
+ }
+ 
+ int ff_hevc_sao_offset_sign_decode(HEVCLocalContext *lc)
+ {
+-    return get_cabac_bypass(&lc->cc);
++    return get_cabac_bypass(&lc->sub.cc);
+ }
+ 
+ int ff_hevc_sao_eo_class_decode(HEVCLocalContext *lc)
+ {
+-    int ret = get_cabac_bypass(&lc->cc) << 1;
+-    ret    |= get_cabac_bypass(&lc->cc);
++    int ret = get_cabac_bypass(&lc->sub.cc) << 1;
++    ret    |= get_cabac_bypass(&lc->sub.cc);
+     return ret;
+ }
+ 
+ int ff_hevc_end_of_slice_flag_decode(HEVCLocalContext *lc)
+ {
+-    return get_cabac_terminate(&lc->cc);
++    return get_cabac_terminate(&lc->sub.cc);
+ }
+ 
+ int ff_hevc_cu_transquant_bypass_flag_decode(HEVCLocalContext *lc)
+@@ -595,7 +616,7 @@ int ff_hevc_cu_qp_delta_abs(HEVCLocalContext *lc)
+     }
+     if (prefix_val >= 5) {
+         int k = 0;
+-        while (k < 7 && get_cabac_bypass(&lc->cc)) {
++        while (k < 7 && get_cabac_bypass(&lc->sub.cc)) {
+             suffix_val += 1 << k;
+             k++;
+         }
+@@ -605,14 +626,14 @@ int ff_hevc_cu_qp_delta_abs(HEVCLocalContext *lc)
+         }
+ 
+         while (k--)
+-            suffix_val += get_cabac_bypass(&lc->cc) << k;
++            suffix_val += get_cabac_bypass(&lc->sub.cc) << k;
+     }
+     return prefix_val + suffix_val;
+ }
+ 
+ int ff_hevc_cu_qp_delta_sign_flag(HEVCLocalContext *lc)
+ {
+-    return get_cabac_bypass(&lc->cc);
++    return get_cabac_bypass(&lc->sub.cc);
+ }
+ 
+ int ff_hevc_cu_chroma_qp_offset_flag(HEVCLocalContext *lc)
+@@ -682,21 +703,21 @@ int ff_hevc_part_mode_decode(HEVCLocalContext *lc, const HEVCSPS *sps, int log2_
+     if (GET_CABAC(PART_MODE_OFFSET + 1)) { // 01X, 01XX
+         if (GET_CABAC(PART_MODE_OFFSET + 3)) // 011
+             return PART_2NxN;
+-        if (get_cabac_bypass(&lc->cc)) // 0101
++        if (get_cabac_bypass(&lc->sub.cc)) // 0101
+             return PART_2NxnD;
+         return PART_2NxnU; // 0100
+     }
+ 
+     if (GET_CABAC(PART_MODE_OFFSET + 3)) // 001
+         return PART_Nx2N;
+-    if (get_cabac_bypass(&lc->cc)) // 0001
++    if (get_cabac_bypass(&lc->sub.cc)) // 0001
+         return PART_nRx2N;
+     return PART_nLx2N;  // 0000
+ }
+ 
+ int ff_hevc_pcm_flag_decode(HEVCLocalContext *lc)
+ {
+-    return get_cabac_terminate(&lc->cc);
++    return get_cabac_terminate(&lc->sub.cc);
+ }
+ 
+ int ff_hevc_prev_intra_luma_pred_flag_decode(HEVCLocalContext *lc)
+@@ -707,7 +728,7 @@ int ff_hevc_prev_intra_luma_pred_flag_decode(HEVCLocalContext *lc)
+ int ff_hevc_mpm_idx_decode(HEVCLocalContext *lc)
+ {
+     int i = 0;
+-    while (i < 2 && get_cabac_bypass(&lc->cc))
++    while (i < 2 && get_cabac_bypass(&lc->sub.cc))
+         i++;
+     return i;
+ }
+@@ -715,10 +736,10 @@ int ff_hevc_mpm_idx_decode(HEVCLocalContext *lc)
+ int ff_hevc_rem_intra_luma_pred_mode_decode(HEVCLocalContext *lc)
+ {
+     int i;
+-    int value = get_cabac_bypass(&lc->cc);
++    int value = get_cabac_bypass(&lc->sub.cc);
+ 
+     for (i = 0; i < 4; i++)
+-        value = (value << 1) | get_cabac_bypass(&lc->cc);
++        value = (value << 1) | get_cabac_bypass(&lc->sub.cc);
+     return value;
+ }
+ 
+@@ -728,8 +749,8 @@ int ff_hevc_intra_chroma_pred_mode_decode(HEVCLocalContext *lc)
+     if (!GET_CABAC(INTRA_CHROMA_PRED_MODE_OFFSET))
+         return 4;
+ 
+-    ret  = get_cabac_bypass(&lc->cc) << 1;
+-    ret |= get_cabac_bypass(&lc->cc);
++    ret  = get_cabac_bypass(&lc->sub.cc) << 1;
++    ret |= get_cabac_bypass(&lc->sub.cc);
+     return ret;
+ }
+ 
+@@ -738,7 +759,7 @@ int ff_hevc_merge_idx_decode(HEVCLocalContext *lc)
+     int i = GET_CABAC(MERGE_IDX_OFFSET);
+ 
+     if (i != 0) {
+-        while (i < lc->parent->sh.max_num_merge_cand-1 && get_cabac_bypass(&lc->cc))
++        while (i < lc->sh->max_num_merge_cand-1 && get_cabac_bypass(&lc->sub.cc))
+             i++;
+     }
+     return i;
+@@ -768,7 +789,7 @@ int ff_hevc_ref_idx_lx_decode(HEVCLocalContext *lc, int num_ref_idx_lx)
+     while (i < max_ctx && GET_CABAC(REF_IDX_L0_OFFSET + i))
+         i++;
+     if (i == 2) {
+-        while (i < max && get_cabac_bypass(&lc->cc))
++        while (i < max && get_cabac_bypass(&lc->sub.cc))
+             i++;
+     }
+ 
+@@ -800,7 +821,7 @@ static av_always_inline int mvd_decode(HEVCLocalContext *lc)
+     int ret = 2;
+     int k = 1;
+ 
+-    while (k < CABAC_MAX_BIN && get_cabac_bypass(&lc->cc)) {
++    while (k < CABAC_MAX_BIN && get_cabac_bypass(&lc->sub.cc)) {
+         ret += 1U << k;
+         k++;
+     }
+@@ -809,13 +830,13 @@ static av_always_inline int mvd_decode(HEVCLocalContext *lc)
+         return 0;
+     }
+     while (k--)
+-        ret += get_cabac_bypass(&lc->cc) << k;
+-    return get_cabac_bypass_sign(&lc->cc, -ret);
++        ret += get_cabac_bypass(&lc->sub.cc) << k;
++    return get_cabac_bypass_sign(&lc->sub.cc, -ret);
+ }
+ 
+ static av_always_inline int mvd_sign_flag_decode(HEVCLocalContext *lc)
+ {
+-    return get_cabac_bypass_sign(&lc->cc, -1);
++    return get_cabac_bypass_sign(&lc->sub.cc, -1);
+ }
+ 
+ int ff_hevc_split_transform_flag_decode(HEVCLocalContext *lc, int log2_trafo_size)
+@@ -894,10 +915,10 @@ static av_always_inline int last_significant_coeff_suffix_decode(HEVCLocalContex
+ {
+     int i;
+     int length = (last_significant_coeff_prefix >> 1) - 1;
+-    int value = get_cabac_bypass(&lc->cc);
++    int value = get_cabac_bypass(&lc->sub.cc);
+ 
+     for (i = 1; i < length; i++)
+-        value = (value << 1) | get_cabac_bypass(&lc->cc);
++        value = (value << 1) | get_cabac_bypass(&lc->sub.cc);
+     return value;
+ }
+ 
+@@ -945,12 +966,12 @@ static av_always_inline int coeff_abs_level_remaining_decode(HEVCLocalContext *l
+     int last_coeff_abs_level_remaining;
+     int i;
+ 
+-    while (prefix < CABAC_MAX_BIN && get_cabac_bypass(&lc->cc))
++    while (prefix < CABAC_MAX_BIN && get_cabac_bypass(&lc->sub.cc))
+         prefix++;
+ 
+     if (prefix < 3) {
+         for (i = 0; i < rc_rice_param; i++)
+-            suffix = (suffix << 1) | get_cabac_bypass(&lc->cc);
++            suffix = (suffix << 1) | get_cabac_bypass(&lc->sub.cc);
+         last_coeff_abs_level_remaining = (prefix << rc_rice_param) + suffix;
+     } else {
+         int prefix_minus3 = prefix - 3;
+@@ -961,7 +982,7 @@ static av_always_inline int coeff_abs_level_remaining_decode(HEVCLocalContext *l
+         }
+ 
+         for (i = 0; i < prefix_minus3 + rc_rice_param; i++)
+-            suffix = (suffix << 1) | get_cabac_bypass(&lc->cc);
++            suffix = (suffix << 1) | get_cabac_bypass(&lc->sub.cc);
+         last_coeff_abs_level_remaining = (((1 << prefix_minus3) + 3 - 1)
+                                               << rc_rice_param) + suffix;
+     }
+@@ -974,7 +995,7 @@ static av_always_inline int coeff_sign_flag_decode(HEVCLocalContext *lc, uint8_t
+     int ret = 0;
+ 
+     for (i = 0; i < nb; i++)
+-        ret = (ret << 1) | get_cabac_bypass(&lc->cc);
++        ret = (ret << 1) | get_cabac_bypass(&lc->sub.cc);
+     return ret;
+ }
+ 
+@@ -1040,7 +1061,7 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
+             7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 10, 10, 10, 10,
+             10, 10, 11, 11, 11, 11, 11, 11, 12, 12
+         };
+-        int qp_y = lc->qp_y;
++        int qp_y = lc->sub.qp_y;
+ 
+         if (pps->transform_skip_enabled_flag &&
+             log2_trafo_size <= pps->log2_max_transform_skip_block_size) {
+@@ -1053,11 +1074,11 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
+             int qp_i, offset;
+ 
+             if (c_idx == 1)
+-                offset = pps->cb_qp_offset + s->sh.slice_cb_qp_offset +
+-                         lc->tu.cu_qp_offset_cb;
++                offset = pps->cb_qp_offset + lc->sh->slice_cb_qp_offset +
++                         lc->sub.cu_qp_offset_cb;
+             else
+-                offset = pps->cr_qp_offset + s->sh.slice_cr_qp_offset +
+-                         lc->tu.cu_qp_offset_cr;
++                offset = pps->cr_qp_offset + lc->sh->slice_cr_qp_offset +
++                         lc->sub.cu_qp_offset_cr;
+ 
+             qp_i = av_clip(qp_y + offset, - sps->qp_bd_offset, 57);
+             if (sps->chroma_format_idc == 1) {
+@@ -1323,7 +1344,7 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
+                     sb_type = 2 * (c_idx == 0 ? 1 : 0);
+                 else
+                     sb_type = 2 * (c_idx == 0 ? 1 : 0) + 1;
+-                c_rice_param = lc->stat_coeff[sb_type] / 4;
++                c_rice_param = lc->sub.stat_coeff[sb_type] / 4;
+             }
+ 
+             if (!(i == num_last_subset) && greater1_ctx == 0)
+@@ -1375,12 +1396,12 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
+                         if (trans_coeff_level > (3 << c_rice_param))
+                             c_rice_param = sps->persistent_rice_adaptation_enabled ? c_rice_param + 1 : FFMIN(c_rice_param + 1, 4);
+                         if (sps->persistent_rice_adaptation_enabled && !rice_init) {
+-                            int c_rice_p_init = lc->stat_coeff[sb_type] / 4;
++                            int c_rice_p_init = lc->sub.stat_coeff[sb_type] / 4;
+                             if (last_coeff_abs_level_remaining >= (3 << c_rice_p_init))
+-                                lc->stat_coeff[sb_type]++;
++                                lc->sub.stat_coeff[sb_type]++;
+                             else if (2 * last_coeff_abs_level_remaining < (1 << c_rice_p_init))
+-                                if (lc->stat_coeff[sb_type] > 0)
+-                                    lc->stat_coeff[sb_type]--;
++                                if (lc->sub.stat_coeff[sb_type] > 0)
++                                    lc->sub.stat_coeff[sb_type]--;
+                             rice_init = 1;
+                         }
+                     }
+@@ -1391,12 +1412,12 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
+                     if (trans_coeff_level > (3 << c_rice_param))
+                         c_rice_param = sps->persistent_rice_adaptation_enabled ? c_rice_param + 1 : FFMIN(c_rice_param + 1, 4);
+                     if (sps->persistent_rice_adaptation_enabled && !rice_init) {
+-                        int c_rice_p_init = lc->stat_coeff[sb_type] / 4;
++                        int c_rice_p_init = lc->sub.stat_coeff[sb_type] / 4;
+                         if (last_coeff_abs_level_remaining >= (3 << c_rice_p_init))
+-                            lc->stat_coeff[sb_type]++;
++                            lc->sub.stat_coeff[sb_type]++;
+                         else if (2 * last_coeff_abs_level_remaining < (1 << c_rice_p_init))
+-                            if (lc->stat_coeff[sb_type] > 0)
+-                                lc->stat_coeff[sb_type]--;
++                            if (lc->sub.stat_coeff[sb_type] > 0)
++                                lc->sub.stat_coeff[sb_type]--;
+                         rice_init = 1;
+                     }
+                 }
+diff --git a/libavcodec/hevc/filter.c b/libavcodec/hevc/filter.c
+index 68ae0e9ef69f0b598376747c64ce0fb7f70eeb79..401ece9a1731bacd455ac17174f7ae54bc49fdcc 100644
+--- a/libavcodec/hevc/filter.c
++++ b/libavcodec/hevc/filter.c
+@@ -94,11 +94,11 @@ static int get_qPy_pred(HEVCLocalContext *lc, const HEVCContext *s,
+     int qPy_pred, qPy_a, qPy_b;
+ 
+     // qPy_pred
+-    if (lc->first_qp_group || (!xQgBase && !yQgBase)) {
+-        lc->first_qp_group = !lc->tu.is_cu_qp_delta_coded;
+-        qPy_pred = s->sh.slice_qp;
++    if (lc->sub.first_qp_group || (!xQgBase && !yQgBase)) {
++        lc->sub.first_qp_group = !lc->tu.is_cu_qp_delta_coded;
++        qPy_pred = lc->sh->slice_qp;
+     } else {
+-        qPy_pred = lc->qPy_pred;
++        qPy_pred = lc->sub.qPy_pred;
+     }
+ 
+     // qPy_a
+@@ -129,10 +129,10 @@ void ff_hevc_set_qPy(HEVCLocalContext *lc,
+ 
+     if (lc->tu.cu_qp_delta != 0) {
+         int off = sps->qp_bd_offset;
+-        lc->qp_y = FFUMOD(qp_y + lc->tu.cu_qp_delta + 52 + 2 * off,
++        lc->sub.qp_y = FFUMOD(qp_y + lc->tu.cu_qp_delta + 52 + 2 * off,
+                                  52 + off) - off;
+     } else
+-        lc->qp_y = qp_y;
++        lc->sub.qp_y = qp_y;
+ }
+ 
+ static int get_qPy(const HEVCSPS *sps, const int8_t *qp_y_tab, int xC, int yC)
+@@ -675,13 +675,16 @@ static void deblocking_filter_CTB(const HEVCContext *s, const HEVCLayerContext *
+     }
+ }
+ 
+-static int boundary_strength(const HEVCContext *s, const MvField *curr, const MvField *neigh,
++/* rpl is the reference list of the slice curr belongs to, neigh_refPicList
++ * the one of the neighbour. */
++static int boundary_strength(const RefPicList *rpl,
++                             const MvField *curr, const MvField *neigh,
+                              const RefPicList *neigh_refPicList)
+ {
+     if (curr->pred_flag == PF_BI &&  neigh->pred_flag == PF_BI) {
+         // same L0 and L1
+-        if (s->cur_frame->refPicList[0].list[curr->ref_idx[0]] == neigh_refPicList[0].list[neigh->ref_idx[0]]  &&
+-            s->cur_frame->refPicList[0].list[curr->ref_idx[0]] == s->cur_frame->refPicList[1].list[curr->ref_idx[1]] &&
++        if (rpl[0].list[curr->ref_idx[0]] == neigh_refPicList[0].list[neigh->ref_idx[0]]  &&
++            rpl[0].list[curr->ref_idx[0]] == rpl[1].list[curr->ref_idx[1]] &&
+             neigh_refPicList[0].list[neigh->ref_idx[0]] == neigh_refPicList[1].list[neigh->ref_idx[1]]) {
+             if ((FFABS(neigh->mv[0].x - curr->mv[0].x) >= 4 || FFABS(neigh->mv[0].y - curr->mv[0].y) >= 4 ||
+                  FFABS(neigh->mv[1].x - curr->mv[1].x) >= 4 || FFABS(neigh->mv[1].y - curr->mv[1].y) >= 4) &&
+@@ -690,15 +693,15 @@ static int boundary_strength(const HEVCContext *s, const MvField *curr, const Mv
+                 return 1;
+             else
+                 return 0;
+-        } else if (neigh_refPicList[0].list[neigh->ref_idx[0]] == s->cur_frame->refPicList[0].list[curr->ref_idx[0]] &&
+-                   neigh_refPicList[1].list[neigh->ref_idx[1]] == s->cur_frame->refPicList[1].list[curr->ref_idx[1]]) {
++        } else if (neigh_refPicList[0].list[neigh->ref_idx[0]] == rpl[0].list[curr->ref_idx[0]] &&
++                   neigh_refPicList[1].list[neigh->ref_idx[1]] == rpl[1].list[curr->ref_idx[1]]) {
+             if (FFABS(neigh->mv[0].x - curr->mv[0].x) >= 4 || FFABS(neigh->mv[0].y - curr->mv[0].y) >= 4 ||
+                 FFABS(neigh->mv[1].x - curr->mv[1].x) >= 4 || FFABS(neigh->mv[1].y - curr->mv[1].y) >= 4)
+                 return 1;
+             else
+                 return 0;
+-        } else if (neigh_refPicList[1].list[neigh->ref_idx[1]] == s->cur_frame->refPicList[0].list[curr->ref_idx[0]] &&
+-                   neigh_refPicList[0].list[neigh->ref_idx[0]] == s->cur_frame->refPicList[1].list[curr->ref_idx[1]]) {
++        } else if (neigh_refPicList[1].list[neigh->ref_idx[1]] == rpl[0].list[curr->ref_idx[0]] &&
++                   neigh_refPicList[0].list[neigh->ref_idx[0]] == rpl[1].list[curr->ref_idx[1]]) {
+             if (FFABS(neigh->mv[1].x - curr->mv[0].x) >= 4 || FFABS(neigh->mv[1].y - curr->mv[0].y) >= 4 ||
+                 FFABS(neigh->mv[0].x - curr->mv[1].x) >= 4 || FFABS(neigh->mv[0].y - curr->mv[1].y) >= 4)
+                 return 1;
+@@ -713,10 +716,10 @@ static int boundary_strength(const HEVCContext *s, const MvField *curr, const Mv
+ 
+         if (curr->pred_flag & 1) {
+             A     = curr->mv[0];
+-            ref_A = s->cur_frame->refPicList[0].list[curr->ref_idx[0]];
++            ref_A = rpl[0].list[curr->ref_idx[0]];
+         } else {
+             A     = curr->mv[1];
+-            ref_A = s->cur_frame->refPicList[1].list[curr->ref_idx[1]];
++            ref_A = rpl[1].list[curr->ref_idx[1]];
+         }
+ 
+         if (neigh->pred_flag & 1) {
+@@ -757,7 +760,7 @@ void ff_hevc_deblocking_boundary_strengths(HEVCLocalContext *lc, const HEVCLayer
+ 
+     boundary_upper = y0 > 0 && !(y0 & 7);
+     if (boundary_upper &&
+-        ((!s->sh.slice_loop_filter_across_slices_enabled_flag &&
++        ((!lc->sh->slice_loop_filter_across_slices_enabled_flag &&
+           lc->boundary_flags & BOUNDARY_UPPER_SLICE &&
+           (y0 % (1 << sps->log2_ctb_size)) == 0) ||
+          (!pps->loop_filter_across_tiles_enabled_flag &&
+@@ -768,7 +771,7 @@ void ff_hevc_deblocking_boundary_strengths(HEVCLocalContext *lc, const HEVCLayer
+     if (boundary_upper) {
+         const RefPicList *rpl_top = (lc->boundary_flags & BOUNDARY_UPPER_SLICE) ?
+                                     ff_hevc_get_ref_list(s->cur_frame, x0, y0 - 1) :
+-                                    s->cur_frame->refPicList;
++                                    lc->rpl;
+         int yp_pu = (y0 - 1) >> log2_min_pu_size;
+         int yq_pu =  y0      >> log2_min_pu_size;
+         int yp_tu = (y0 - 1) >> log2_min_tu_size;
+@@ -787,7 +790,7 @@ void ff_hevc_deblocking_boundary_strengths(HEVCLocalContext *lc, const HEVCLayer
+                 else if (curr_cbf_luma || top_cbf_luma)
+                     bs = 1;
+                 else
+-                    bs = boundary_strength(s, curr, top, rpl_top);
++                    bs = boundary_strength(lc->rpl, curr, top, rpl_top);
+                 l->horizontal_bs[((x0 + i) + y0 * l->bs_width) >> 2] = bs;
+             }
+     }
+@@ -795,7 +798,7 @@ void ff_hevc_deblocking_boundary_strengths(HEVCLocalContext *lc, const HEVCLayer
+     // bs for vertical TU boundaries
+     boundary_left = x0 > 0 && !(x0 & 7);
+     if (boundary_left &&
+-        ((!s->sh.slice_loop_filter_across_slices_enabled_flag &&
++        ((!lc->sh->slice_loop_filter_across_slices_enabled_flag &&
+           lc->boundary_flags & BOUNDARY_LEFT_SLICE &&
+           (x0 % (1 << sps->log2_ctb_size)) == 0) ||
+          (!pps->loop_filter_across_tiles_enabled_flag &&
+@@ -806,7 +809,7 @@ void ff_hevc_deblocking_boundary_strengths(HEVCLocalContext *lc, const HEVCLayer
+     if (boundary_left) {
+         const RefPicList *rpl_left = (lc->boundary_flags & BOUNDARY_LEFT_SLICE) ?
+                                      ff_hevc_get_ref_list(s->cur_frame, x0 - 1, y0) :
+-                                     s->cur_frame->refPicList;
++                                     lc->rpl;
+         int xp_pu = (x0 - 1) >> log2_min_pu_size;
+         int xq_pu =  x0      >> log2_min_pu_size;
+         int xp_tu = (x0 - 1) >> log2_min_tu_size;
+@@ -825,13 +828,13 @@ void ff_hevc_deblocking_boundary_strengths(HEVCLocalContext *lc, const HEVCLayer
+                 else if (curr_cbf_luma || left_cbf_luma)
+                     bs = 1;
+                 else
+-                    bs = boundary_strength(s, curr, left, rpl_left);
++                    bs = boundary_strength(lc->rpl, curr, left, rpl_left);
+                 l->vertical_bs[(x0 + (y0 + i) * l->bs_width) >> 2] = bs;
+             }
+     }
+ 
+     if (log2_trafo_size > log2_min_pu_size && !is_intra) {
+-        const RefPicList *rpl = s->cur_frame->refPicList;
++        const RefPicList *rpl = lc->rpl;
+ 
+         // bs for TU internal horizontal PU boundaries
+         for (j = 8; j < (1 << log2_trafo_size); j += 8) {
+@@ -843,7 +846,7 @@ void ff_hevc_deblocking_boundary_strengths(HEVCLocalContext *lc, const HEVCLayer
+                 const MvField *top  = &tab_mvf[yp_pu * min_pu_width + x_pu];
+                 const MvField *curr = &tab_mvf[yq_pu * min_pu_width + x_pu];
+ 
+-                bs = boundary_strength(s, curr, top, rpl);
++                bs = boundary_strength(rpl, curr, top, rpl);
+                 l->horizontal_bs[((x0 + i) + (y0 + j) * l->bs_width) >> 2] = bs;
+             }
+         }
+@@ -858,7 +861,7 @@ void ff_hevc_deblocking_boundary_strengths(HEVCLocalContext *lc, const HEVCLayer
+                 const MvField *left = &tab_mvf[y_pu * min_pu_width + xp_pu];
+                 const MvField *curr = &tab_mvf[y_pu * min_pu_width + xq_pu];
+ 
+-                bs = boundary_strength(s, curr, left, rpl);
++                bs = boundary_strength(rpl, curr, left, rpl);
+                 l->vertical_bs[((x0 + i) + (y0 + j) * l->bs_width) >> 2] = bs;
+             }
+         }
+@@ -877,14 +880,20 @@ void ff_hevc_hls_filter(HEVCLocalContext *lc, const HEVCLayerContext *l,
+     const HEVCContext *const s = lc->parent;
+     int x_end = x >= sps->width  - ctb_size;
+     int skip = 0;
++
++    /* The deferred slices of a picture are decoded once its packet has been
++     * parsed, when nal_unit_type is the one of the last NAL unit in that
++     * packet, a suffix SEI for instance. The type of the picture itself is in
++     * first_nal_type, which is what these two discard levels ask about. */
+     if (s->avctx->skip_loop_filter >= AVDISCARD_ALL ||
+-        (s->avctx->skip_loop_filter >= AVDISCARD_NONKEY && !IS_IDR(s)) ||
++        (s->avctx->skip_loop_filter >= AVDISCARD_NONKEY &&
++         !IS_IDR_TYPE(s->first_nal_type)) ||
+         (s->avctx->skip_loop_filter >= AVDISCARD_NONINTRA &&
+-         s->sh.slice_type != HEVC_SLICE_I) ||
++         lc->sh->slice_type != HEVC_SLICE_I) ||
+         (s->avctx->skip_loop_filter >= AVDISCARD_BIDIR &&
+-         s->sh.slice_type == HEVC_SLICE_B) ||
++         lc->sh->slice_type == HEVC_SLICE_B) ||
+         (s->avctx->skip_loop_filter >= AVDISCARD_NONREF &&
+-        ff_hevc_nal_is_nonref(s->nal_unit_type)))
++        ff_hevc_nal_is_nonref(s->first_nal_type)))
+         skip = 1;
+ 
+     if (!skip)
+diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
+index ae5f0fe69d89532b53cd10b41a4a6761bb3150ff..d9db1dd5df62b6aad6431b3fdb7389dc04bddb3a 100644
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -1210,14 +1210,13 @@ static void hls_sao_param(HEVCLocalContext *lc, const HEVCLayerContext *l,
+                           const HEVCPPS *pps, const HEVCSPS *sps,
+                           int rx, int ry)
+ {
+-    const HEVCContext *const s = lc->parent;
+     int sao_merge_left_flag = 0;
+     int sao_merge_up_flag   = 0;
+     SAOParams *sao          = &CTB(l->sao, rx, ry);
+     int c_idx, i;
+ 
+-    if (s->sh.slice_sample_adaptive_offset_flag[0] ||
+-        s->sh.slice_sample_adaptive_offset_flag[1]) {
++    if (lc->sh->slice_sample_adaptive_offset_flag[0] ||
++        lc->sh->slice_sample_adaptive_offset_flag[1]) {
+         if (rx > 0) {
+             if (lc->ctb_left_flag)
+                 sao_merge_left_flag = ff_hevc_sao_merge_flag_decode(lc);
+@@ -1232,7 +1231,7 @@ static void hls_sao_param(HEVCLocalContext *lc, const HEVCLayerContext *l,
+         int log2_sao_offset_scale = c_idx == 0 ? pps->log2_sao_offset_scale_luma :
+                                                  pps->log2_sao_offset_scale_chroma;
+ 
+-        if (!s->sh.slice_sample_adaptive_offset_flag[c_idx]) {
++        if (!lc->sh->slice_sample_adaptive_offset_flag[c_idx]) {
+             sao->type_idx[c_idx] = SAO_NOT_APPLIED;
+             continue;
+         }
+@@ -1346,7 +1345,7 @@ static int hls_transform_unit(HEVCLocalContext *lc,
+             ff_hevc_set_qPy(lc, l, pps, cb_xBase, cb_yBase, log2_cb_size);
+         }
+ 
+-        if (s->sh.cu_chroma_qp_offset_enabled_flag && cbf_chroma &&
++        if (lc->sh->cu_chroma_qp_offset_enabled_flag && cbf_chroma &&
+             !lc->cu.cu_transquant_bypass_flag  &&  !lc->tu.is_cu_chroma_qp_offset_coded) {
+             int cu_chroma_qp_offset_flag = ff_hevc_cu_chroma_qp_offset_flag(lc);
+             if (cu_chroma_qp_offset_flag) {
+@@ -1356,11 +1355,11 @@ static int hls_transform_unit(HEVCLocalContext *lc,
+                     av_log(s->avctx, AV_LOG_ERROR,
+                         "cu_chroma_qp_offset_idx not yet tested.\n");
+                 }
+-                lc->tu.cu_qp_offset_cb = pps->cb_qp_offset_list[cu_chroma_qp_offset_idx];
+-                lc->tu.cu_qp_offset_cr = pps->cr_qp_offset_list[cu_chroma_qp_offset_idx];
++                lc->sub.cu_qp_offset_cb = pps->cb_qp_offset_list[cu_chroma_qp_offset_idx];
++                lc->sub.cu_qp_offset_cr = pps->cr_qp_offset_list[cu_chroma_qp_offset_idx];
+             } else {
+-                lc->tu.cu_qp_offset_cb = 0;
+-                lc->tu.cu_qp_offset_cr = 0;
++                lc->sub.cu_qp_offset_cb = 0;
++                lc->sub.cu_qp_offset_cr = 0;
+             }
+             lc->tu.is_cu_chroma_qp_offset_coded = 1;
+         }
+@@ -1535,7 +1534,6 @@ static int hls_transform_tree(HEVCLocalContext *lc,
+                               int trafo_depth, int blk_idx,
+                               const int *base_cbf_cb, const int *base_cbf_cr)
+ {
+-    const HEVCContext *const s = lc->parent;
+     uint8_t split_transform_flag;
+     int cbf_cb[2];
+     int cbf_cr[2];
+@@ -1644,7 +1642,7 @@ do {
+                     l->cbf_luma[y_tu * min_tu_width + x_tu] = 1;
+                 }
+         }
+-        if (!s->sh.disable_deblocking_filter_flag) {
++        if (!lc->sh->disable_deblocking_filter_flag) {
+             ff_hevc_deblocking_boundary_strengths(lc, l, pps, x0, y0, log2_trafo_size);
+             if (pps->transquant_bypass_enable_flag &&
+                 lc->cu.cu_transquant_bypass_flag)
+@@ -1668,10 +1666,10 @@ static int hls_pcm_sample(HEVCLocalContext *lc, const HEVCLayerContext *l,
+                          (((cb_size >> sps->hshift[1]) * (cb_size >> sps->vshift[1])) +
+                           ((cb_size >> sps->hshift[2]) * (cb_size >> sps->vshift[2]))) *
+                           sps->pcm.bit_depth_chroma : 0);
+-    const uint8_t *pcm = skip_bytes(&lc->cc, (length + 7) >> 3);
++    const uint8_t *pcm = skip_bytes(&lc->sub.cc, (length + 7) >> 3);
+     int ret;
+ 
+-    if (!s->sh.disable_deblocking_filter_flag)
++    if (!lc->sh->disable_deblocking_filter_flag)
+         ff_hevc_deblocking_boundary_strengths(lc, l, pps, x0, y0, log2_cb_size);
+ 
+     ret = init_get_bits(&gb, pcm, length);
+@@ -1727,8 +1725,8 @@ static void luma_mc_uni(HEVCLocalContext *lc,
+     int pic_height       = sps->height;
+     int mx               = mv->x & 3;
+     int my               = mv->y & 3;
+-    int weight_flag      = (s->sh.slice_type == HEVC_SLICE_P && pps->weighted_pred_flag) ||
+-                           (s->sh.slice_type == HEVC_SLICE_B && pps->weighted_bipred_flag);
++    int weight_flag      = (lc->sh->slice_type == HEVC_SLICE_P && pps->weighted_pred_flag) ||
++                           (lc->sh->slice_type == HEVC_SLICE_B && pps->weighted_bipred_flag);
+     int idx              = hevc_pel_weight[block_w];
+ 
+     x_off += mv->x >> 2;
+@@ -1758,7 +1756,7 @@ static void luma_mc_uni(HEVCLocalContext *lc,
+                                                       block_h, mx, my, block_w);
+     else
+         s->hevcdsp.put_hevc_qpel_uni_w[idx][!!my][!!mx](dst, dststride, src, srcstride,
+-                                                        block_h, s->sh.luma_log2_weight_denom,
++                                                        block_h, lc->sh->luma_log2_weight_denom,
+                                                         luma_weight, luma_offset, mx, my, block_w);
+ }
+ 
+@@ -1794,8 +1792,8 @@ static void luma_mc_bi(HEVCLocalContext *lc,
+     int my0              = mv0->y & 3;
+     int mx1              = mv1->x & 3;
+     int my1              = mv1->y & 3;
+-    int weight_flag      = (s->sh.slice_type == HEVC_SLICE_P && pps->weighted_pred_flag) ||
+-                           (s->sh.slice_type == HEVC_SLICE_B && pps->weighted_bipred_flag);
++    int weight_flag      = (lc->sh->slice_type == HEVC_SLICE_P && pps->weighted_pred_flag) ||
++                           (lc->sh->slice_type == HEVC_SLICE_B && pps->weighted_bipred_flag);
+     int x_off0           = x_off + (mv0->x >> 2);
+     int y_off0           = y_off + (mv0->y >> 2);
+     int x_off1           = x_off + (mv1->x >> 2);
+@@ -1846,11 +1844,11 @@ static void luma_mc_bi(HEVCLocalContext *lc,
+                                                        block_h, mx1, my1, block_w);
+     else
+         s->hevcdsp.put_hevc_qpel_bi_w[idx][!!my1][!!mx1](dst, dststride, src1, src1stride, lc->tmp,
+-                                                         block_h, s->sh.luma_log2_weight_denom,
+-                                                         s->sh.luma_weight_l0[current_mv->ref_idx[0]],
+-                                                         s->sh.luma_weight_l1[current_mv->ref_idx[1]],
+-                                                         s->sh.luma_offset_l0[current_mv->ref_idx[0]],
+-                                                         s->sh.luma_offset_l1[current_mv->ref_idx[1]],
++                                                         block_h, lc->sh->luma_log2_weight_denom,
++                                                         lc->sh->luma_weight_l0[current_mv->ref_idx[0]],
++                                                         lc->sh->luma_weight_l1[current_mv->ref_idx[1]],
++                                                         lc->sh->luma_offset_l0[current_mv->ref_idx[0]],
++                                                         lc->sh->luma_offset_l1[current_mv->ref_idx[1]],
+                                                          mx1, my1, block_w);
+ 
+ }
+@@ -1883,8 +1881,8 @@ static void chroma_mc_uni(HEVCLocalContext *lc,
+     int pic_width        = sps->width >> sps->hshift[1];
+     int pic_height       = sps->height >> sps->vshift[1];
+     const Mv *mv         = &current_mv->mv[reflist];
+-    int weight_flag      = (s->sh.slice_type == HEVC_SLICE_P && pps->weighted_pred_flag) ||
+-                           (s->sh.slice_type == HEVC_SLICE_B && pps->weighted_bipred_flag);
++    int weight_flag      = (lc->sh->slice_type == HEVC_SLICE_P && pps->weighted_pred_flag) ||
++                           (lc->sh->slice_type == HEVC_SLICE_B && pps->weighted_bipred_flag);
+     int idx              = hevc_pel_weight[block_w];
+     int hshift           = sps->hshift[1];
+     int vshift           = sps->vshift[1];
+@@ -1921,7 +1919,7 @@ static void chroma_mc_uni(HEVCLocalContext *lc,
+                                                   block_h, _mx, _my, block_w);
+     else
+         s->hevcdsp.put_hevc_epel_uni_w[idx][!!my][!!mx](dst0, dststride, src0, srcstride,
+-                                                        block_h, s->sh.chroma_log2_weight_denom,
++                                                        block_h, lc->sh->chroma_log2_weight_denom,
+                                                         chroma_weight, chroma_offset, _mx, _my, block_w);
+ }
+ 
+@@ -1953,8 +1951,8 @@ static void chroma_mc_bi(HEVCLocalContext *lc,
+     const uint8_t *src2  = ref1->data[cidx+1];
+     ptrdiff_t src1stride = ref0->linesize[cidx+1];
+     ptrdiff_t src2stride = ref1->linesize[cidx+1];
+-    int weight_flag      = (s->sh.slice_type == HEVC_SLICE_P && pps->weighted_pred_flag) ||
+-                           (s->sh.slice_type == HEVC_SLICE_B && pps->weighted_bipred_flag);
++    int weight_flag      = (lc->sh->slice_type == HEVC_SLICE_P && pps->weighted_pred_flag) ||
++                           (lc->sh->slice_type == HEVC_SLICE_B && pps->weighted_bipred_flag);
+     int pic_width        = sps->width >> sps->hshift[1];
+     int pic_height       = sps->height >> sps->vshift[1];
+     const Mv *const mv0  = &current_mv->mv[0];
+@@ -2027,11 +2025,11 @@ static void chroma_mc_bi(HEVCLocalContext *lc,
+         s->hevcdsp.put_hevc_epel_bi_w[idx][!!my1][!!mx1](dst0, s->cur_frame->f->linesize[cidx+1],
+                                                          src2, src2stride, lc->tmp,
+                                                          block_h,
+-                                                         s->sh.chroma_log2_weight_denom,
+-                                                         s->sh.chroma_weight_l0[current_mv->ref_idx[0]][cidx],
+-                                                         s->sh.chroma_weight_l1[current_mv->ref_idx[1]][cidx],
+-                                                         s->sh.chroma_offset_l0[current_mv->ref_idx[0]][cidx],
+-                                                         s->sh.chroma_offset_l1[current_mv->ref_idx[1]][cidx],
++                                                         lc->sh->chroma_log2_weight_denom,
++                                                         lc->sh->chroma_weight_l0[current_mv->ref_idx[0]][cidx],
++                                                         lc->sh->chroma_weight_l1[current_mv->ref_idx[1]][cidx],
++                                                         lc->sh->chroma_offset_l0[current_mv->ref_idx[0]][cidx],
++                                                         lc->sh->chroma_offset_l1[current_mv->ref_idx[1]][cidx],
+                                                          _mx1, _my1, block_w);
+ }
+ 
+@@ -2051,18 +2049,17 @@ static void hevc_luma_mv_mvp_mode(HEVCLocalContext *lc,
+                                   int nPbH, int log2_cb_size, int part_idx,
+                                   int merge_idx, MvField *mv)
+ {
+-    const HEVCContext *const s = lc->parent;
+     enum InterPredIdc inter_pred_idc = PRED_L0;
+     int mvp_flag;
+ 
+     ff_hevc_set_neighbour_available(lc, x0, y0, nPbW, nPbH, sps->log2_ctb_size);
+     mv->pred_flag = 0;
+-    if (s->sh.slice_type == HEVC_SLICE_B)
++    if (lc->sh->slice_type == HEVC_SLICE_B)
+         inter_pred_idc = ff_hevc_inter_pred_idc_decode(lc, nPbW, nPbH);
+ 
+     if (inter_pred_idc != PRED_L1) {
+-        if (s->sh.nb_refs[L0])
+-            mv->ref_idx[0]= ff_hevc_ref_idx_lx_decode(lc, s->sh.nb_refs[L0]);
++        if (lc->sh->nb_refs[L0])
++            mv->ref_idx[0]= ff_hevc_ref_idx_lx_decode(lc, lc->sh->nb_refs[L0]);
+ 
+         mv->pred_flag = PF_L0;
+         ff_hevc_hls_mvd_coding(lc, x0, y0, 0);
+@@ -2074,10 +2071,10 @@ static void hevc_luma_mv_mvp_mode(HEVCLocalContext *lc,
+     }
+ 
+     if (inter_pred_idc != PRED_L0) {
+-        if (s->sh.nb_refs[L1])
+-            mv->ref_idx[1]= ff_hevc_ref_idx_lx_decode(lc, s->sh.nb_refs[L1]);
++        if (lc->sh->nb_refs[L1])
++            mv->ref_idx[1]= ff_hevc_ref_idx_lx_decode(lc, lc->sh->nb_refs[L1]);
+ 
+-        if (s->sh.mvd_l1_zero_flag == 1 && inter_pred_idc == PRED_BI) {
++        if (lc->sh->mvd_l1_zero_flag == 1 && inter_pred_idc == PRED_BI) {
+             AV_ZERO32(&lc->pu.mvd);
+         } else {
+             ff_hevc_hls_mvd_coding(lc, x0, y0, 1);
+@@ -2109,7 +2106,7 @@ static void hls_prediction_unit(HEVCLocalContext *lc,
+     int min_pu_width = sps->min_pu_width;
+ 
+     MvField *tab_mvf = s->cur_frame->tab_mvf;
+-    const RefPicList *refPicList = s->cur_frame->refPicList;
++    const RefPicList *refPicList = lc->rpl;
+     const HEVCFrame *ref0 = NULL, *ref1 = NULL;
+     const int *linesize = s->cur_frame->f->linesize;
+     uint8_t *dst0 = s->cur_frame->f->data[0] + y0 * linesize[0] + (x0 << sps->pixel_shift);
+@@ -2128,7 +2125,7 @@ static void hls_prediction_unit(HEVCLocalContext *lc,
+         lc->pu.merge_flag = ff_hevc_merge_flag_decode(lc);
+ 
+     if (skip_flag || lc->pu.merge_flag) {
+-        if (s->sh.max_num_merge_cand > 1)
++        if (lc->sh->max_num_merge_cand > 1)
+             merge_idx = ff_hevc_merge_idx_decode(lc);
+         else
+             merge_idx = 0;
+@@ -2168,16 +2165,16 @@ static void hls_prediction_unit(HEVCLocalContext *lc,
+ 
+         luma_mc_uni(lc, pps, sps, dst0, linesize[0], ref0->f,
+                     &current_mv.mv[0], x0, y0, nPbW, nPbH,
+-                    s->sh.luma_weight_l0[current_mv.ref_idx[0]],
+-                    s->sh.luma_offset_l0[current_mv.ref_idx[0]]);
++                    lc->sh->luma_weight_l0[current_mv.ref_idx[0]],
++                    lc->sh->luma_offset_l0[current_mv.ref_idx[0]]);
+ 
+         if (sps->chroma_format_idc) {
+             chroma_mc_uni(lc, pps, sps, dst1, linesize[1], ref0->f->data[1], ref0->f->linesize[1],
+                           0, x0_c, y0_c, nPbW_c, nPbH_c, &current_mv,
+-                          s->sh.chroma_weight_l0[current_mv.ref_idx[0]][0], s->sh.chroma_offset_l0[current_mv.ref_idx[0]][0]);
++                          lc->sh->chroma_weight_l0[current_mv.ref_idx[0]][0], lc->sh->chroma_offset_l0[current_mv.ref_idx[0]][0]);
+             chroma_mc_uni(lc, pps, sps, dst2, linesize[2], ref0->f->data[2], ref0->f->linesize[2],
+                           0, x0_c, y0_c, nPbW_c, nPbH_c, &current_mv,
+-                          s->sh.chroma_weight_l0[current_mv.ref_idx[0]][1], s->sh.chroma_offset_l0[current_mv.ref_idx[0]][1]);
++                          lc->sh->chroma_weight_l0[current_mv.ref_idx[0]][1], lc->sh->chroma_offset_l0[current_mv.ref_idx[0]][1]);
+         }
+     } else if (current_mv.pred_flag == PF_L1) {
+         int x0_c = x0 >> sps->hshift[1];
+@@ -2187,17 +2184,17 @@ static void hls_prediction_unit(HEVCLocalContext *lc,
+ 
+         luma_mc_uni(lc, pps, sps, dst0, linesize[0], ref1->f,
+                     &current_mv.mv[1], x0, y0, nPbW, nPbH,
+-                    s->sh.luma_weight_l1[current_mv.ref_idx[1]],
+-                    s->sh.luma_offset_l1[current_mv.ref_idx[1]]);
++                    lc->sh->luma_weight_l1[current_mv.ref_idx[1]],
++                    lc->sh->luma_offset_l1[current_mv.ref_idx[1]]);
+ 
+         if (sps->chroma_format_idc) {
+             chroma_mc_uni(lc, pps, sps, dst1, linesize[1], ref1->f->data[1], ref1->f->linesize[1],
+                           1, x0_c, y0_c, nPbW_c, nPbH_c, &current_mv,
+-                          s->sh.chroma_weight_l1[current_mv.ref_idx[1]][0], s->sh.chroma_offset_l1[current_mv.ref_idx[1]][0]);
++                          lc->sh->chroma_weight_l1[current_mv.ref_idx[1]][0], lc->sh->chroma_offset_l1[current_mv.ref_idx[1]][0]);
+ 
+             chroma_mc_uni(lc, pps, sps, dst2, linesize[2], ref1->f->data[2], ref1->f->linesize[2],
+                           1, x0_c, y0_c, nPbW_c, nPbH_c, &current_mv,
+-                          s->sh.chroma_weight_l1[current_mv.ref_idx[1]][1], s->sh.chroma_offset_l1[current_mv.ref_idx[1]][1]);
++                          lc->sh->chroma_weight_l1[current_mv.ref_idx[1]][1], lc->sh->chroma_offset_l1[current_mv.ref_idx[1]][1]);
+         }
+     } else if (current_mv.pred_flag == PF_BI) {
+         int x0_c = x0 >> sps->hshift[1];
+@@ -2448,7 +2445,7 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s,
+     } else
+         lc->cu.cu_transquant_bypass_flag = 0;
+ 
+-    if (s->sh.slice_type != HEVC_SLICE_I) {
++    if (lc->sh->slice_type != HEVC_SLICE_I) {
+         const int x0b = av_zero_extend(x0, sps->log2_ctb_size);
+         const int y0b = av_zero_extend(y0, sps->log2_ctb_size);
+         uint8_t skip_flag = ff_hevc_skip_flag_decode(lc, l->skip_flag,
+@@ -2474,12 +2471,12 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s,
+                             x0, y0, cb_size, cb_size, log2_cb_size, 0, idx);
+         intra_prediction_unit_default_value(lc, l, sps, x0, y0, log2_cb_size);
+ 
+-        if (!s->sh.disable_deblocking_filter_flag)
++        if (!lc->sh->disable_deblocking_filter_flag)
+             ff_hevc_deblocking_boundary_strengths(lc, l, pps, x0, y0, log2_cb_size);
+     } else {
+         int pcm_flag = 0;
+ 
+-        if (s->sh.slice_type != HEVC_SLICE_I)
++        if (lc->sh->slice_type != HEVC_SLICE_I)
+             lc->cu.pred_mode = ff_hevc_pred_mode_decode(lc);
+         if (lc->cu.pred_mode != MODE_INTRA ||
+             log2_cb_size == sps->log2_min_cb_size) {
+@@ -2579,7 +2576,7 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s,
+                 if (ret < 0)
+                     return ret;
+             } else {
+-                if (!s->sh.disable_deblocking_filter_flag)
++                if (!lc->sh->disable_deblocking_filter_flag)
+                     ff_hevc_deblocking_boundary_strengths(lc, l, pps, x0, y0, log2_cb_size);
+             }
+         }
+@@ -2590,13 +2587,13 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s,
+ 
+     x = y_cb * min_cb_width + x_cb;
+     for (y = 0; y < length; y++) {
+-        memset(&l->qp_y_tab[x], lc->qp_y, length);
++        memset(&l->qp_y_tab[x], lc->sub.qp_y, length);
+         x += min_cb_width;
+     }
+ 
+     if(((x0 + (1<<log2_cb_size)) & qp_block_mask) == 0 &&
+        ((y0 + (1<<log2_cb_size)) & qp_block_mask) == 0) {
+-        lc->qPy_pred = lc->qp_y;
++        lc->sub.qPy_pred = lc->sub.qp_y;
+     }
+ 
+     set_ct_depth(sps, l->tab_ct_depth, x0, y0, log2_cb_size, lc->ct_depth);
+@@ -2630,7 +2627,7 @@ static int hls_coding_quadtree(HEVCLocalContext *lc,
+         lc->tu.cu_qp_delta          = 0;
+     }
+ 
+-    if (s->sh.cu_chroma_qp_offset_enabled_flag &&
++    if (lc->sh->cu_chroma_qp_offset_enabled_flag &&
+         log2_cb_size >= sps->log2_ctb_size - pps->diff_cu_chroma_qp_offset_depth) {
+         lc->tu.is_cu_chroma_qp_offset_coded = 0;
+     }
+@@ -2670,7 +2667,7 @@ static int hls_coding_quadtree(HEVCLocalContext *lc,
+ 
+         if(((x0 + (1<<log2_cb_size)) & qp_block_mask) == 0 &&
+             ((y0 + (1<<log2_cb_size)) & qp_block_mask) == 0)
+-            lc->qPy_pred = lc->qp_y;
++            lc->sub.qPy_pred = lc->sub.qp_y;
+ 
+         if (more_data)
+             return ((x1 + cb_size_split) < sps->width ||
+@@ -2702,22 +2699,21 @@ static void hls_decode_neighbour(HEVCLocalContext *lc,
+                                  const HEVCPPS *pps, const HEVCSPS *sps,
+                                  int x_ctb, int y_ctb, int ctb_addr_ts)
+ {
+-    const HEVCContext *const s = lc->parent;
+     int ctb_size          = 1 << sps->log2_ctb_size;
+     int ctb_addr_rs       = pps->ctb_addr_ts_to_rs[ctb_addr_ts];
+-    int ctb_addr_in_slice = ctb_addr_rs - s->sh.slice_addr;
++    int ctb_addr_in_slice = ctb_addr_rs - lc->sh->slice_addr;
+ 
+-    l->tab_slice_address[ctb_addr_rs] = s->sh.slice_addr;
++    l->tab_slice_address[ctb_addr_rs] = lc->sh->slice_addr;
+ 
+     if (pps->entropy_coding_sync_enabled_flag) {
+         if (x_ctb == 0 && (y_ctb & (ctb_size - 1)) == 0)
+-            lc->first_qp_group = 1;
++            lc->sub.first_qp_group = 1;
+         lc->end_of_tiles_x = sps->width;
+     } else if (pps->tiles_enabled_flag) {
+         if (ctb_addr_ts && pps->tile_id[ctb_addr_ts] != pps->tile_id[ctb_addr_ts - 1]) {
+             int idxX = pps->col_idxX[x_ctb >> sps->log2_ctb_size];
+             lc->end_of_tiles_x   = x_ctb + (pps->column_width[idxX] << sps->log2_ctb_size);
+-            lc->first_qp_group   = 1;
++            lc->sub.first_qp_group   = 1;
+         }
+     } else {
+         lc->end_of_tiles_x = sps->width;
+@@ -2748,51 +2744,77 @@ static void hls_decode_neighbour(HEVCLocalContext *lc,
+     lc->ctb_up_left_flag = ((x_ctb > 0) && (y_ctb > 0)  && (ctb_addr_in_slice-1 >= sps->ctb_width) && (pps->tile_id[ctb_addr_ts] == pps->tile_id[pps->ctb_addr_rs_to_ts[ctb_addr_rs-1 - sps->ctb_width]]));
+ }
+ 
++/* Decode a single CTB. Which substream is read, and from where, is described
++ * by lc->sub. */
++static int decode_ctb(HEVCContext *s, const HEVCLayerContext *l,
++                      HEVCLocalContext *lc, int ctb_addr_rs)
++{
++    const HEVCPPS   *const pps = s->pps;
++    const HEVCSPS   *const sps = pps->sps;
++    const int ctb_size    = 1 << sps->log2_ctb_size;
++    const int ctb_addr_ts = pps->ctb_addr_rs_to_ts[ctb_addr_rs];
++    const int x_ctb       = (ctb_addr_rs % sps->ctb_width) << sps->log2_ctb_size;
++    const int y_ctb       = (ctb_addr_rs / sps->ctb_width) << sps->log2_ctb_size;
++    int ret;
++
++    hls_decode_neighbour(lc, l, pps, sps, x_ctb, y_ctb, ctb_addr_ts);
++
++    ret = ff_hevc_cabac_init(lc, pps, ctb_addr_ts);
++    if (ret < 0)
++        goto fail;
++
++    hls_sao_param(lc, l, pps, sps,
++                  ctb_addr_rs % sps->ctb_width, ctb_addr_rs / sps->ctb_width);
++
++    l->deblock[ctb_addr_rs].beta_offset = lc->sh->beta_offset;
++    l->deblock[ctb_addr_rs].tc_offset   = lc->sh->tc_offset;
++    l->filter_slice_edges[ctb_addr_rs]  = lc->sh->slice_loop_filter_across_slices_enabled_flag;
++
++    ret = hls_coding_quadtree(lc, l, pps, sps, x_ctb, y_ctb, sps->log2_ctb_size, 0);
++    if (ret < 0)
++        goto fail;
++
++    ff_hevc_save_states(lc, pps, ctb_addr_ts + 1);
++    ff_hevc_hls_filters(lc, l, pps, x_ctb, y_ctb, ctb_size);
++
++    /* The return value of hls_coding_quadtree() tells whether the slice goes on */
++    return ret;
++
++fail:
++    l->tab_slice_address[ctb_addr_rs] = -1;
++    return ret;
++}
++
+ static int hls_decode_entry(HEVCContext *s, GetBitContext *gb)
+ {
+     HEVCLocalContext *const lc = &s->local_ctx[0];
+     const HEVCLayerContext *const l = &s->layers[s->cur_layer];
+     const HEVCPPS   *const pps = s->pps;
+     const HEVCSPS   *const sps = pps->sps;
+-    const uint8_t *slice_data = gb->buffer + s->sh.data_offset;
+-    const size_t   slice_size = get_bits_bytesize(gb, 1) - s->sh.data_offset;
+     int ctb_size    = 1 << sps->log2_ctb_size;
+     int more_data   = 1;
+     int x_ctb       = 0;
+     int y_ctb       = 0;
+-    int ctb_addr_ts = pps->ctb_addr_rs_to_ts[s->sh.slice_ctb_addr_rs];
+-    int ret;
++    int ctb_addr_ts = pps->ctb_addr_rs_to_ts[lc->sh->slice_ctb_addr_rs];
++
++    /* One slice segment is read from a single buffer. When it contains tile
++     * or WPP row boundaries, CABAC continues byte-aligned inside that same
++     * buffer, so opened stays set. */
++    lc->sub.data   = gb->buffer + lc->sh->data_offset;
++    lc->sub.size   = get_bits_bytesize(gb, 1) - lc->sh->data_offset;
++    lc->sub.opened = 0;
+ 
+     while (more_data && ctb_addr_ts < sps->ctb_size) {
+         int ctb_addr_rs = pps->ctb_addr_ts_to_rs[ctb_addr_ts];
+ 
+         x_ctb = (ctb_addr_rs % ((sps->width + ctb_size - 1) >> sps->log2_ctb_size)) << sps->log2_ctb_size;
+         y_ctb = (ctb_addr_rs / ((sps->width + ctb_size - 1) >> sps->log2_ctb_size)) << sps->log2_ctb_size;
+-        hls_decode_neighbour(lc, l, pps, sps, x_ctb, y_ctb, ctb_addr_ts);
+-
+-        ret = ff_hevc_cabac_init(lc, pps, ctb_addr_ts, slice_data, slice_size, 0);
+-        if (ret < 0) {
+-            l->tab_slice_address[ctb_addr_rs] = -1;
+-            return ret;
+-        }
+-
+-        hls_sao_param(lc, l, pps, sps,
+-                      x_ctb >> sps->log2_ctb_size, y_ctb >> sps->log2_ctb_size);
+-
+-        l->deblock[ctb_addr_rs].beta_offset = s->sh.beta_offset;
+-        l->deblock[ctb_addr_rs].tc_offset   = s->sh.tc_offset;
+-        l->filter_slice_edges[ctb_addr_rs]  = s->sh.slice_loop_filter_across_slices_enabled_flag;
+ 
+-        more_data = hls_coding_quadtree(lc, l, pps, sps, x_ctb, y_ctb, sps->log2_ctb_size, 0);
+-        if (more_data < 0) {
+-            l->tab_slice_address[ctb_addr_rs] = -1;
++        more_data = decode_ctb(s, l, lc, ctb_addr_rs);
++        if (more_data < 0)
+             return more_data;
+-        }
+-
+ 
+         ctb_addr_ts++;
+-        ff_hevc_save_states(lc, pps, ctb_addr_ts);
+-        ff_hevc_hls_filters(lc, l, pps, x_ctb, y_ctb, ctb_size);
+     }
+ 
+     if (x_ctb + ctb_size >= sps->width &&
+@@ -2802,6 +2824,541 @@ static int hls_decode_entry(HEVCContext *s, GetBitContext *gb)
+     return ctb_addr_ts;
+ }
+ 
++/* Streams split into tile columns lose frame threading because of the tile
++ * scan order: every column is walked from top to bottom, so the following
++ * frame asks for the lower CTB rows early while the current one publishes
++ * them only once the last column is done. The path below walks the picture in
++ * row major order instead, finishing one CTB row across all tile columns
++ * before moving on to the next, which matches the order rows are published in
++ * to the order they are awaited in. Every tile column gets its own substream
++ * state (HEVCSubstream) and the decoding operations are unchanged, so the
++ * output is bit-exact. The threading structure is left alone. */
++
++static int alloc_local_ctxs(HEVCContext *s, unsigned n)
++{
++    HEVCLocalContext *tmp;
++
++    if (n <= s->nb_local_ctx)
++        return 0;
++
++    tmp = av_malloc_array(n, sizeof(*s->local_ctx));
++    if (!tmp)
++        return AVERROR(ENOMEM);
++
++    memcpy(tmp, s->local_ctx, sizeof(*s->local_ctx) * s->nb_local_ctx);
++    av_free(s->local_ctx);
++    s->local_ctx = tmp;
++
++    for (unsigned i = s->nb_local_ctx; i < n; i++) {
++        tmp = &s->local_ctx[i];
++
++        memset(tmp, 0, sizeof(*tmp));
++
++        tmp->logctx             = s->avctx;
++        tmp->parent             = s;
++        tmp->common_cabac_state = &s->cabac;
++    }
++
++    s->nb_local_ctx = n;
++
++    return 0;
++}
++
++/* Fill in the position and size of each entry point substream in
++ * sh.offset/sh.size, with the emulation prevention bytes accounted for. */
++static int slice_substream_offsets(HEVCContext *s, const H2645NAL *nal)
++{
++    const int length = nal->size;
++    int64_t offset, startheader, cmpt = 0;
++    int i, j;
++
++    offset = s->sh.data_offset;
++
++    for (j = 0, cmpt = 0, startheader = offset + s->sh.entry_point_offset[0];
++         j < nal->skipped_bytes; j++) {
++        if (nal->skipped_bytes_pos[j] >= offset && nal->skipped_bytes_pos[j] < startheader) {
++            startheader--;
++            cmpt++;
++        }
++    }
++
++    for (i = 1; i < s->sh.num_entry_point_offsets; i++) {
++        offset += (s->sh.entry_point_offset[i - 1] - cmpt);
++        for (j = 0, cmpt = 0, startheader = offset
++             + s->sh.entry_point_offset[i]; j < nal->skipped_bytes; j++) {
++            if (nal->skipped_bytes_pos[j] >= offset && nal->skipped_bytes_pos[j] < startheader) {
++                startheader--;
++                cmpt++;
++            }
++        }
++        s->sh.size[i]   = s->sh.entry_point_offset[i] - cmpt;
++        s->sh.offset[i] = offset;
++    }
++
++    offset += s->sh.entry_point_offset[s->sh.num_entry_point_offsets - 1] - cmpt;
++    if (length < offset) {
++        av_log(s->avctx, AV_LOG_ERROR, "entry_point_offset table is corrupted\n");
++        return AVERROR_INVALIDDATA;
++    }
++    s->sh.size  [s->sh.num_entry_point_offsets] = length - offset;
++    s->sh.offset[s->sh.num_entry_point_offsets] = offset;
++
++    s->sh.offset[0] = s->sh.data_offset;
++    s->sh.size[0]   = s->sh.offset[1] - s->sh.offset[0];
++
++    s->data = nal->data;
++
++    return 0;
++}
++
++/* Point a substream at new data. CABAC is opened at its first CTB, opened
++ * being cleared, and QP prediction returns to its slice start state. */
++static void substream_load(HEVCSubstream *sub, const uint8_t *data, size_t size,
++                           int qp_y_seed)
++{
++    sub->data   = data;
++    sub->size   = size;
++    sub->opened = 0;
++
++    sub->first_qp_group  = 1;
++    sub->qp_y            = qp_y_seed;
++    sub->cu_qp_offset_cb = 0;
++    sub->cu_qp_offset_cr = 0;
++}
++
++/* Finish filtering the last CTB when the slice ended at the bottom right of
++ * the picture. Same as the tail of the serial path, hls_decode_entry(). */
++static void finish_last_ctb_filter(HEVCContext *s, const HEVCLayerContext *l,
++                                   HEVCLocalContext *lc, int x_ctb, int y_ctb)
++{
++    const HEVCPPS *const pps = s->pps;
++    const HEVCSPS *const sps = pps->sps;
++    const int ctb_size = 1 << sps->log2_ctb_size;
++
++    if (x_ctb + ctb_size >= sps->width && y_ctb + ctb_size >= sps->height)
++        ff_hevc_hls_filter(lc, l, pps, x_ctb, y_ctb, ctb_size);
++}
++
++/* Whether the row major traversal applies here. tile_interleave is -1 for
++ * auto, 0 for off and 1 to force it, the latter being meant for testing. */
++static int tile_interleave_wanted(const HEVCContext *s, const HEVCPPS *pps)
++{
++    if (!s->tile_interleave || !pps || !pps->tiles_enabled_flag ||
++        pps->entropy_coding_sync_enabled_flag || pps->num_tile_columns <= 1)
++        return 0;
++
++    /* There is only something to gain while frame threading is in use */
++    if (s->tile_interleave < 0 && !(s->avctx->active_thread_type & FF_THREAD_FRAME))
++        return 0;
++
++    return pps->num_tile_columns * pps->num_tile_rows > 1;
++}
++
++/* Make room for one tile stream entry per tile and clear the table, which is
++ * only used within a single picture. */
++static int alloc_tile_streams(HEVCContext *s, unsigned n)
++{
++    if (n > s->tile_streams_alloc) {
++        void *tmp = av_realloc_array(s->tile_streams, n, sizeof(*s->tile_streams));
++
++        if (!tmp)
++            return AVERROR(ENOMEM);
++
++        s->tile_streams       = tmp;
++        s->tile_streams_alloc = n;
++    }
++
++    memset(s->tile_streams, 0, n * sizeof(*s->tile_streams));
++
++    return 0;
++}
++
++/* Make room for one substream state per tile column. Only the space is
++ * allocated here, as the contents are set up again by the traversal loop with
++ * substream_load() for every tile. */
++static int alloc_substreams(HEVCContext *s, unsigned n)
++{
++    if (n > s->nb_substreams) {
++        HEVCSubstream *tmp = av_realloc_array(s->substreams, n, sizeof(*tmp));
++
++        if (!tmp)
++            return AVERROR(ENOMEM);
++
++        memset(tmp + s->nb_substreams, 0,
++               (n - s->nb_substreams) * sizeof(*tmp));
++
++        s->substreams    = tmp;
++        s->nb_substreams = n;
++    }
++
++    return 0;
++}
++
++/* Set which slice this context decodes. HEVCContext is left untouched, so
++ * streams with a different slice per tile can be decoded interleaved without
++ * overwriting each other's state. */
++static void bind_slice_ctx(HEVCLocalContext *lc, const SliceHeader *sh,
++                           const RefPicList *rpl, const HEVCFrame *collocated_ref)
++{
++    lc->sh             = sh;
++    lc->rpl            = rpl;
++    lc->collocated_ref = collocated_ref;
++}
++
++/* Bind the slice that was just parsed. Used by the serial path and by WPP. */
++static void bind_current_slice(HEVCContext *s, HEVCLocalContext *lc)
++{
++    bind_slice_ctx(lc, &s->sh, s->cur_frame ? s->cur_frame->refPicList : NULL,
++                   s->collocated_ref);
++}
++
++/* Walk the tile stream table in CTB row major order, which is simply walking
++ * the raster addresses of the picture. One substream state per tile column is
++ * enough: within a band of tile rows there is exactly one tile per column,
++ * and moving on to the next band points that state at the data of the next
++ * tile. The column index follows from tile_id being assigned in tile row
++ * major order, see the tile layout in ps.c. When the column changes, the
++ * state of the new column is loaded into lc and the one in use is stored
++ * back. */
++static int decode_tiles_row_major(HEVCContext *s, const HEVCLayerContext *l,
++                                  HEVCTileStream *tiles)
++{
++    const HEVCPPS   *const pps = s->pps;
++    const HEVCSPS   *const sps = pps->sps;
++    HEVCLocalContext *const lc = &s->local_ctx[0];
++    HEVCSubstream *cur = NULL;
++    int last_ctb_decoded = 0;
++    int ret;
++
++    for (int rs = 0; rs < sps->ctb_size; rs++) {
++        const int ts   = pps->ctb_addr_rs_to_ts[rs];
++        const int tile = pps->tile_id[ts];
++        HEVCTileStream *const t   = &tiles[tile];
++        HEVCSubstream  *const sub = &s->substreams[tile % pps->num_tile_columns];
++
++        if (t->ended)
++            continue;
++
++        if (cur != sub) {
++            if (cur)
++                *cur = lc->sub;
++            lc->sub = *sub;
++            cur = sub;
++        }
++
++        bind_slice_ctx(lc, t->sh, t->rpl, t->collocated_ref);
++
++        /* First CTB of the tile: point the substream at this tile's data */
++        if (ts == t->start_ts)
++            substream_load(&lc->sub, t->data, t->size, t->qp_y_seed);
++
++        ret = decode_ctb(s, l, lc, rs);
++        if (ret < 0)
++            return ret;
++
++        if (rs == sps->ctb_size - 1)
++            last_ctb_decoded = 1;
++
++        /* The substream signalled its end. For an intact stream this is the
++         * last CTB of the tile, otherwise the tile is decoded only this
++         * far. */
++        if (!ret)
++            t->ended = 1;
++    }
++
++    /* Same as the tail of the serial path: if the last CTB was decoded,
++     * finish filtering it. lc still carries the slice decoded last, that is
++     * the one of the last column. */
++    if (last_ctb_decoded)
++        finish_last_ctb_filter(s, l, lc,
++                               (sps->ctb_width  - 1) << sps->log2_ctb_size,
++                               (sps->ctb_height - 1) << sps->log2_ctb_size);
++
++    return 0;
++}
++
++/* The case where the tiles are bound together in a single slice by entry
++ * points. The substream positions come from the slice header, so the table is
++ * filled in directly. */
++static int hls_decode_entry_tiles(HEVCContext *s, const H2645NAL *nal)
++{
++    const HEVCLayerContext *const l = &s->layers[s->cur_layer];
++    const HEVCPPS   *const pps = s->pps;
++    const HEVCSPS   *const sps = pps->sps;
++    const int nb_tiles = pps->num_tile_columns * pps->num_tile_rows;
++    int ret;
++
++    ret = slice_substream_offsets(s, nal);
++    if (ret < 0)
++        return ret;
++
++    ret = alloc_substreams(s, pps->num_tile_columns);
++    if (ret < 0)
++        return ret;
++
++    ret = alloc_tile_streams(s, nb_tiles);
++    if (ret < 0)
++        return ret;
++
++    for (int i = 0; i < nb_tiles; i++) {
++        HEVCTileStream *const t = &s->tile_streams[i];
++        const int start_ts = pps->ctb_addr_rs_to_ts[pps->tile_pos_rs[i]];
++
++        if (s->sh.size[i] <= 0 || pps->tile_id[start_ts] != i)
++            return AVERROR_INVALIDDATA;
++
++        t->sh        = &s->sh;
++        t->rpl       = s->cur_frame->refPicList;
++        t->collocated_ref = s->collocated_ref;
++        t->data      = s->data + s->sh.offset[i];
++        t->size      = s->sh.size[i];
++        t->start_ts  = start_ts;
++        /* The QP seed is the value decode_slice_data() left in lc[0]; with
++         * cu_qp_delta enabled it must not be overwritten with slice_qp */
++        t->qp_y_seed = s->local_ctx[0].sub.qp_y;
++    }
++
++    ret = decode_tiles_row_major(s, l, s->tile_streams);
++    if (ret < 0)
++        return ret;
++
++    return sps->ctb_size;
++}
++
++/* Position and size of the CABAC substream of a deferred slice. This is
++ * where a size going negative on damaged input is caught. */
++static int tile_slice_payload(const HEVCTileSlice *sl,
++                              const uint8_t **data, size_t *size)
++{
++    if (sl->size <= 0 || sl->sh.data_offset >= (unsigned)sl->size)
++        return AVERROR_INVALIDDATA;
++
++    *data = sl->data + sl->sh.data_offset;
++    *size = sl->size - sl->sh.data_offset;
++
++    return 0;
++}
++
++/* Whether this slice may be deferred. Only an independent slice covering
++ * exactly one tile is; a slice starting in the middle of a tile, or a
++ * dependent one, cannot be reordered. */
++static int slice_is_deferrable(const HEVCContext *s)
++{
++    const HEVCPPS *const pps = s->pps;
++    int start_ts;
++
++    if (!tile_interleave_wanted(s, pps)         ||
++        s->sh.num_entry_point_offsets != 0      ||
++        s->sh.dependent_slice_segment_flag      ||
++        s->cur_layer != 0                       ||
++        !s->cur_frame)
++        return 0;
++
++    /* Do not mix in what was collected for another frame. This does not
++     * happen on the normal path. */
++    if (s->nb_tile_slices && s->cur_frame != s->tile_slices_frame)
++        return 0;
++
++    start_ts = pps->ctb_addr_rs_to_ts[s->sh.slice_ctb_addr_rs];
++
++    if (start_ts < 0 || start_ts >= pps->sps->ctb_size ||
++        (start_ts > 0 && pps->tile_id[start_ts - 1] == pps->tile_id[start_ts]))
++        return 0;
++
++    return 1;
++}
++
++/* Collect the slice if it may be deferred. Returns 1 when it was, 0 when it
++ * was not eligible and an error code when it could not be collected. Falling
++ * back to decoding it right away is not an option, as the slices already
++ * collected would then be decoded after this one. */
++static int defer_tile_slice(HEVCContext *s, const H2645NAL *nal)
++{
++    const HEVCPPS *const pps = s->pps;
++    HEVCTileSlice *sl;
++    int start_ts;
++
++    if (!slice_is_deferrable(s))
++        return 0;
++
++    start_ts = pps->ctb_addr_rs_to_ts[s->sh.slice_ctb_addr_rs];
++
++    if (s->nb_tile_slices >= s->tile_slices_alloc) {
++        unsigned n = s->tile_slices_alloc ? s->tile_slices_alloc * 2 : 8;
++        void *tmp = av_realloc_array(s->tile_slices, n, sizeof(*s->tile_slices));
++
++        if (!tmp)
++            return AVERROR(ENOMEM);
++
++        s->tile_slices       = tmp;
++        s->tile_slices_alloc = n;
++    }
++
++    if (!s->nb_tile_slices) {
++        s->tile_slices_frame = s->cur_frame;
++        s->tile_slices_layer = s->cur_layer;
++    }
++
++    sl = &s->tile_slices[s->nb_tile_slices++];
++
++    sl->sh        = s->sh;
++    sl->data      = nal->data;
++    sl->size      = nal->size;
++    sl->start_ts  = start_ts;
++    sl->qp_y_seed = s->local_ctx[0].sub.qp_y;
++
++    /* Hold on to the reference state as it was when this slice was parsed.
++     * By the time the slices are decoded together, what is left in
++     * HEVCContext belongs to the last slice and cannot be used. */
++    sl->rpl            = s->cur_frame->refPicList;
++    sl->collocated_ref = s->collocated_ref;
++
++    /* The heap allocated arrays of the header are refilled when the next
++     * slice header is parsed, so holding them in a shallow copy would observe
++     * values belonging to another slice. This path only defers slices without
++     * entry points, so they are unused here, but clear them so that a later
++     * user fails loudly instead of reading the wrong values. */
++    sl->sh.entry_point_offset = NULL;
++    sl->sh.offset             = NULL;
++    sl->sh.size               = NULL;
++
++    return 1;
++}
++
++/* Fill in the tile stream table and return 1 if the deferred slices map one
++ * to one onto the tiles of the picture. Return 0 otherwise, which hands them
++ * back to decoding in their original order. */
++static int build_tile_streams(HEVCContext *s, unsigned nb)
++{
++    const HEVCPPS *const pps = s->pps;
++    const HEVCSPS *const sps = pps->sps;
++    const unsigned nb_tiles = pps->num_tile_columns * pps->num_tile_rows;
++    int ret;
++
++    if (nb != nb_tiles)
++        return 0;
++
++    ret = alloc_tile_streams(s, nb_tiles);
++    if (ret < 0)
++        return ret;
++
++    for (unsigned i = 0; i < nb; i++) {
++        const HEVCTileSlice *const sl = &s->tile_slices[i];
++        HEVCTileStream *t;
++        const uint8_t *data;
++        size_t size;
++        int tile;
++
++        if (sl->start_ts < 0 || sl->start_ts >= sps->ctb_size)
++            return 0;
++
++        tile = pps->tile_id[sl->start_ts];
++
++        if (tile < 0 || tile >= (int)nb_tiles)
++            return 0;
++
++        /* Every slice has to start at a tile, one slice per tile */
++        if (pps->ctb_addr_rs_to_ts[pps->tile_pos_rs[tile]] != sl->start_ts)
++            return 0;
++
++        t = &s->tile_streams[tile];
++        if (t->sh)
++            return 0;
++
++        if (tile_slice_payload(sl, &data, &size) < 0)
++            return 0;
++
++        t->sh        = &sl->sh;
++        t->rpl       = sl->rpl;
++        t->collocated_ref = sl->collocated_ref;
++        t->data      = data;
++        t->size      = size;
++        t->start_ts  = sl->start_ts;
++        t->qp_y_seed = sl->qp_y_seed;
++    }
++
++    for (unsigned i = 0; i < nb_tiles; i++)
++        if (!s->tile_streams[i].sh)
++            return 0;
++
++    return 1;
++}
++
++/* Decode the deferred slices. picture_complete says that no further slice
++ * can arrive for this picture, which is the only case in which what was
++ * collected may be assumed to cover the whole picture, so those are decoded
++ * together in row major order. When the buffer is flushed in the middle of a
++ * picture because another slice came in, more slices are still to come, so
++ * they are decoded one by one in their original tile scan order to preserve
++ * the previous behaviour. */
++static int decode_deferred_tile_slices(HEVCContext *s, int picture_complete)
++{
++    const HEVCPPS   *const pps = s->pps;
++    const HEVCSPS   *const sps = pps ? pps->sps : NULL;
++    const HEVCLayerContext *const l = &s->layers[s->tile_slices_layer];
++    const unsigned nb = s->nb_tile_slices;
++    int interleave = 0, ret;
++
++    s->nb_tile_slices = 0;
++
++    if (!nb)
++        return 0;
++
++    /* Drop what was collected when it does not belong to the current frame,
++     * rather than decoding it into a foreign one. The normal path flushes
++     * before the picture changes, so this does not trigger there. */
++    if (!pps || !sps || !s->cur_frame || s->cur_frame != s->tile_slices_frame) {
++        av_log(s->avctx, AV_LOG_WARNING,
++               "Dropping %u deferred tile slice(s) of a stale picture\n", nb);
++        return 0;
++    }
++
++    if (picture_complete) {
++        interleave = build_tile_streams(s, nb);
++        if (interleave < 0)
++            return interleave;
++    }
++
++    if (interleave) {
++        ret = alloc_substreams(s, pps->num_tile_columns);
++        if (ret < 0)
++            return ret;
++
++        return decode_tiles_row_major(s, l, s->tile_streams);
++    }
++
++    /* The bitstream tells where a slice ends, so follow more_data. */
++    for (unsigned i = 0; i < nb; i++) {
++        const HEVCTileSlice *const sl = &s->tile_slices[i];
++        HEVCLocalContext *const lc = &s->local_ctx[0];
++        const uint8_t *data;
++        size_t size;
++        int more_data = 1;
++        int x_ctb = 0, y_ctb = 0;
++
++        if (tile_slice_payload(sl, &data, &size) < 0)
++            continue;
++
++        bind_slice_ctx(lc, &sl->sh, sl->rpl, sl->collocated_ref);
++        substream_load(&lc->sub, data, size, sl->qp_y_seed);
++
++        for (int ts = sl->start_ts; more_data > 0 && ts < sps->ctb_size; ts++) {
++            int rs = pps->ctb_addr_ts_to_rs[ts];
++
++            x_ctb = (rs % sps->ctb_width) << sps->log2_ctb_size;
++            y_ctb = (rs / sps->ctb_width) << sps->log2_ctb_size;
++
++            more_data = decode_ctb(s, l, lc, rs);
++            if (more_data < 0)
++                return more_data;
++        }
++
++        finish_last_ctb_filter(s, l, lc, x_ctb, y_ctb);
++    }
++
++    return 0;
++}
++
+ static int hls_decode_entry_wpp(AVCodecContext *avctx, void *hevc_lclist,
+                                 int job, int thread)
+ {
+@@ -2813,18 +3370,25 @@ static int hls_decode_entry_wpp(AVCodecContext *avctx, void *hevc_lclist,
+     int ctb_size    = 1 << sps->log2_ctb_size;
+     int more_data   = 1;
+     int ctb_row = job;
+-    int ctb_addr_rs = s->sh.slice_ctb_addr_rs + ctb_row * ((sps->width + ctb_size - 1) >> sps->log2_ctb_size);
++    int ctb_addr_rs = lc->sh->slice_ctb_addr_rs + ctb_row * ((sps->width + ctb_size - 1) >> sps->log2_ctb_size);
+     int ctb_addr_ts = pps->ctb_addr_rs_to_ts[ctb_addr_rs];
+ 
+-    const uint8_t *data      = s->data + s->sh.offset[ctb_row];
+-    const size_t   data_size = s->sh.size[ctb_row];
+-
+     int progress = 0;
+ 
+     int ret;
+ 
++    /* Substream of this job, i.e. of this row. opened is left clear so that
++     * ff_hevc_cabac_init() opens CABAC on the data from its start at the
++     * first CTB of the row. */
++    lc->sub.data   = s->data + lc->sh->offset[ctb_row];
++    lc->sub.size   = lc->sh->size[ctb_row];
++    lc->sub.opened = 0;
++
++    /* Pre-initialization for slices that start in the middle of a row and
++     * therefore do not take the initialization branch below. This preserves
++     * the previous behaviour. */
+     if (ctb_row)
+-        ff_init_cabac_decoder(&lc->cc, data, data_size);
++        ff_init_cabac_decoder(&lc->sub.cc, lc->sub.data, lc->sub.size);
+ 
+     while(more_data && ctb_addr_ts < sps->ctb_size) {
+         int x_ctb = (ctb_addr_rs % sps->ctb_width) << sps->log2_ctb_size;
+@@ -2844,15 +3408,15 @@ static int hls_decode_entry_wpp(AVCodecContext *avctx, void *hevc_lclist,
+             return 0;
+         }
+ 
+-        ret = ff_hevc_cabac_init(lc, pps, ctb_addr_ts, data, data_size, 1);
++        ret = ff_hevc_cabac_init(lc, pps, ctb_addr_ts);
+         if (ret < 0)
+             goto error;
+         hls_sao_param(lc, l, pps, sps,
+                       x_ctb >> sps->log2_ctb_size, y_ctb >> sps->log2_ctb_size);
+ 
+-        l->deblock[ctb_addr_rs].beta_offset = s->sh.beta_offset;
+-        l->deblock[ctb_addr_rs].tc_offset   = s->sh.tc_offset;
+-        l->filter_slice_edges[ctb_addr_rs]  = s->sh.slice_loop_filter_across_slices_enabled_flag;
++        l->deblock[ctb_addr_rs].beta_offset = lc->sh->beta_offset;
++        l->deblock[ctb_addr_rs].tc_offset   = lc->sh->tc_offset;
++        l->filter_slice_edges[ctb_addr_rs]  = lc->sh->slice_loop_filter_across_slices_enabled_flag;
+ 
+         more_data = hls_coding_quadtree(lc, l, pps, sps, x_ctb, y_ctb, sps->log2_ctb_size, 0);
+ 
+@@ -2867,7 +3431,7 @@ static int hls_decode_entry_wpp(AVCodecContext *avctx, void *hevc_lclist,
+         ff_thread_progress_report(&s->wpp_progress[ctb_row], ++progress);
+         ff_hevc_hls_filters(lc, l, pps, x_ctb, y_ctb, ctb_size);
+ 
+-        if (!more_data && (x_ctb+ctb_size) < sps->width && ctb_row != s->sh.num_entry_point_offsets) {
++        if (!more_data && (x_ctb+ctb_size) < sps->width && ctb_row != lc->sh->num_entry_point_offsets) {
+             /* Casting const away here is safe, because it is an atomic operation. */
+             atomic_store((atomic_int*)&s->wpp_err, 1);
+             ff_thread_progress_report(&s->wpp_progress[ctb_row], INT_MAX);
+@@ -2927,12 +3491,8 @@ static int hls_slice_data_wpp(HEVCContext *s, const H2645NAL *nal)
+ {
+     const HEVCPPS *const pps = s->pps;
+     const HEVCSPS *const sps = pps->sps;
+-    const uint8_t *data = nal->data;
+-    int length          = nal->size;
+     int *ret;
+-    int64_t offset;
+-    int64_t startheader, cmpt = 0;
+-    int i, j, res = 0;
++    int i, res = 0;
+ 
+     if (s->sh.slice_ctb_addr_rs + s->sh.num_entry_point_offsets * sps->ctb_width >= sps->ctb_width * sps->ctb_height) {
+         av_log(s->avctx, AV_LOG_ERROR, "WPP ctb addresses are wrong (%d %d %d %d)\n",
+@@ -2942,68 +3502,18 @@ static int hls_slice_data_wpp(HEVCContext *s, const H2645NAL *nal)
+         return AVERROR_INVALIDDATA;
+     }
+ 
+-    if (s->avctx->thread_count > s->nb_local_ctx) {
+-        HEVCLocalContext *tmp = av_malloc_array(s->avctx->thread_count, sizeof(*s->local_ctx));
+-
+-        if (!tmp)
+-            return AVERROR(ENOMEM);
+-
+-        memcpy(tmp, s->local_ctx, sizeof(*s->local_ctx) * s->nb_local_ctx);
+-        av_free(s->local_ctx);
+-        s->local_ctx = tmp;
+-
+-        for (unsigned i = s->nb_local_ctx; i < s->avctx->thread_count; i++) {
+-            tmp = &s->local_ctx[i];
+-
+-            memset(tmp, 0, sizeof(*tmp));
+-
+-            tmp->logctx             = s->avctx;
+-            tmp->parent             = s;
+-            tmp->common_cabac_state = &s->cabac;
+-        }
+-
+-        s->nb_local_ctx = s->avctx->thread_count;
+-    }
+-
+-    offset = s->sh.data_offset;
+-
+-    for (j = 0, cmpt = 0, startheader = offset + s->sh.entry_point_offset[0]; j < nal->skipped_bytes; j++) {
+-        if (nal->skipped_bytes_pos[j] >= offset && nal->skipped_bytes_pos[j] < startheader) {
+-            startheader--;
+-            cmpt++;
+-        }
+-    }
+-
+-    for (i = 1; i < s->sh.num_entry_point_offsets; i++) {
+-        offset += (s->sh.entry_point_offset[i - 1] - cmpt);
+-        for (j = 0, cmpt = 0, startheader = offset
+-             + s->sh.entry_point_offset[i]; j < nal->skipped_bytes; j++) {
+-            if (nal->skipped_bytes_pos[j] >= offset && nal->skipped_bytes_pos[j] < startheader) {
+-                startheader--;
+-                cmpt++;
+-            }
+-        }
+-        s->sh.size[i]   = s->sh.entry_point_offset[i] - cmpt;
+-        s->sh.offset[i] = offset;
+-
+-    }
+-
+-    offset += s->sh.entry_point_offset[s->sh.num_entry_point_offsets - 1] - cmpt;
+-    if (length < offset) {
+-        av_log(s->avctx, AV_LOG_ERROR, "entry_point_offset table is corrupted\n");
+-        return AVERROR_INVALIDDATA;
+-    }
+-    s->sh.size  [s->sh.num_entry_point_offsets] = length - offset;
+-    s->sh.offset[s->sh.num_entry_point_offsets] = offset;
+-
+-    s->sh.offset[0] = s->sh.data_offset;
+-    s->sh.size[0]   = s->sh.offset[1] - s->sh.offset[0];
++    res = alloc_local_ctxs(s, s->avctx->thread_count);
++    if (res < 0)
++        return res;
+ 
+-    s->data = data;
++    res = slice_substream_offsets(s, nal);
++    if (res < 0)
++        return res;
+ 
+     for (i = 1; i < s->nb_local_ctx; i++) {
+-        s->local_ctx[i].first_qp_group = 1;
+-        s->local_ctx[i].qp_y = s->local_ctx[0].qp_y;
++        s->local_ctx[i].sub.first_qp_group = 1;
++        s->local_ctx[i].sub.qp_y = s->local_ctx[0].sub.qp_y;
++        bind_current_slice(s, &s->local_ctx[i]);
+     }
+ 
+     atomic_store(&s->wpp_err, 0);
+@@ -3031,6 +3541,17 @@ static int decode_slice_data(HEVCContext *s, const HEVCLayerContext *l,
+     const HEVCPPS *pps = s->pps;
+     int ret;
+ 
++    /* This slice cannot be deferred. If anything was collected, flush it
++     * first to keep the order. That has to happen before the "is there a
++     * previous slice" check of a dependent slice and before the QP
++     * initialization. More slices are coming for this picture, so they are
++     * not decoded together. */
++    if (s->nb_tile_slices && !slice_is_deferrable(s)) {
++        ret = decode_deferred_tile_slices(s, 0);
++        if (ret < 0)
++            return ret;
++    }
++
+     if (!s->sh.first_slice_in_pic_flag)
+         s->slice_idx += !s->sh.dependent_slice_segment_flag;
+ 
+@@ -3063,19 +3584,35 @@ static int decode_slice_data(HEVCContext *s, const HEVCLayerContext *l,
+         }
+     }
+ 
+-    s->local_ctx[0].first_qp_group = !s->sh.dependent_slice_segment_flag;
++    /* This is the only way into the decoding paths. All the branches below,
++     * serial, WPP and tiles alike, read the slice state from the local
++     * context, so bind it first. */
++    bind_current_slice(s, &s->local_ctx[0]);
++
++    s->local_ctx[0].sub.first_qp_group = !s->sh.dependent_slice_segment_flag;
+ 
+     if (!pps->cu_qp_delta_enabled_flag)
+-        s->local_ctx[0].qp_y = s->sh.slice_qp;
++        s->local_ctx[0].sub.qp_y = s->sh.slice_qp;
+ 
+-    s->local_ctx[0].tu.cu_qp_offset_cb = 0;
+-    s->local_ctx[0].tu.cu_qp_offset_cr = 0;
++    s->local_ctx[0].sub.cu_qp_offset_cb = 0;
++    s->local_ctx[0].sub.cu_qp_offset_cr = 0;
+ 
+     if (s->avctx->active_thread_type == FF_THREAD_SLICE  &&
+         s->sh.num_entry_point_offsets > 0                &&
+         pps->num_tile_rows == 1 && pps->num_tile_columns == 1)
+         return hls_slice_data_wpp(s, nal);
+ 
++    ret = defer_tile_slice(s, nal);
++    if (ret)
++        return ret < 0 ? ret : 0;
++
++    if (tile_interleave_wanted(s, pps)                   &&
++        s->sh.first_slice_in_pic_flag                    &&
++        !s->sh.dependent_slice_segment_flag              &&
++        s->sh.num_entry_point_offsets ==
++            pps->num_tile_columns * pps->num_tile_rows - 1)
++        return hls_decode_entry_tiles(s, nal);
++
+     return hls_decode_entry(s, gb);
+ }
+ 
+@@ -3560,6 +4097,19 @@ static int decode_slice(HEVCContext *s, unsigned nal_idx, GetBitContext *gb)
+         return 0;
+     }
+ 
++    /* A new picture starts, so the previous one is known to be complete. Any
++     * deferred slices are handled before the frame is replaced. At this point
++     * s->pps, s->poc and cur_frame all still belong to the previous picture,
++     * as all three are updated by hevc_frame_start(). This also has to happen
++     * before the layer switch progress report below, which marks the frame of
++     * the previous layer as finished while the deferred slices are the tiles
++     * of exactly that frame. */
++    if (s->nb_tile_slices && s->sh.first_slice_in_pic_flag) {
++        ret = decode_deferred_tile_slices(s, 1);
++        if (ret < 0)
++            return ret;
++    }
++
+     // switching to a new layer, mark previous layer's frame (if any) as done
+     if (s->cur_layer != layer_idx &&
+         s->layers[s->cur_layer].cur_frame &&
+@@ -3709,6 +4259,17 @@ static int decode_nal_units(HEVCContext *s, const uint8_t *buf, int length)
+         l->cur_frame = NULL;
+     }
+ 
++    /* Deferred slices point into the buffers of s->pkt, which the split
++     * below reuses, so anything left over from the previous packet is dropped
++     * here. This decoder finishes a picture per packet, see hevc_frame_end()
++     * at fail: below, so on the normal path there is nothing left. */
++    if (s->nb_tile_slices) {
++        av_log(s->avctx, AV_LOG_WARNING,
++               "Discarding %u deferred tile slice(s) left from the previous packet\n",
++               s->nb_tile_slices);
++        s->nb_tile_slices = 0;
++    }
++
+     /* split the input packet into NAL units, so we know the upper bound on the
+      * number of slices in the frame */
+     ret = ff_h2645_packet_split(&s->pkt, buf, length, s->avctx,
+@@ -3783,6 +4344,16 @@ static int decode_nal_units(HEVCContext *s, const uint8_t *buf, int length)
+     }
+ 
+ fail:
++    /* End of the packet. A picture cannot span packets in this decoder, the
++     * frame is finished below, so the picture is known to be complete
++     * here. */
++    if (s->nb_tile_slices) {
++        int fret = decode_deferred_tile_slices(s, 1);
++
++        if (ret >= 0)
++            ret = fret;
++    }
++
+     for (int i = 0; i < FF_ARRAY_ELEMS(s->layers); i++) {
+         HEVCLayerContext *l = &s->layers[i];
+ 
+@@ -3937,6 +4508,10 @@ static av_cold int hevc_decode_free(AVCodecContext *avctx)
+     av_refstruct_unref(&s->pps);
+ 
+     ff_dovi_ctx_unref(&s->dovi_ctx);
++
++    av_freep(&s->tile_slices);
++    av_freep(&s->tile_streams);
++    av_freep(&s->substreams);
+     av_buffer_unref(&s->rpu_buf);
+ 
+     av_freep(&s->md5_ctx);
+@@ -4198,6 +4773,8 @@ static av_cold void hevc_decode_flush(AVCodecContext *avctx)
+     ff_hevc_reset_sei(&s->sei);
+     ff_dovi_ctx_flush(&s->dovi_ctx);
+     av_buffer_unref(&s->rpu_buf);
++    s->nb_tile_slices    = 0;
++    s->tile_slices_frame = NULL;
+     s->eos = 1;
+ 
+     if (FF_HW_HAS_CB(avctx, flush))
+@@ -4210,6 +4787,9 @@ static av_cold void hevc_decode_flush(AVCodecContext *avctx)
+ static const AVOption options[] = {
+     { "apply_defdispwin", "Apply default display window from VUI", OFFSET(apply_defdispwin),
+         AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
++    { "tile_interleave", "Decode tiled pictures in CTB row order to keep frame threading overlapped "
++        "(-1: auto, 0: off, 1: force)", OFFSET(tile_interleave),
++        AV_OPT_TYPE_INT, {.i64 = -1}, -1, 1, PAR },
+     { "strict-displaywin", "strictly apply default display window size", OFFSET(apply_defdispwin),
+         AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, PAR },
+     { "view_ids", "Array of view IDs that should be decoded and output; a single -1 to decode all views",
+diff --git a/libavcodec/hevc/hevcdec.h b/libavcodec/hevc/hevcdec.h
+index 8394740c4b17c50516246c71dc53dd30957a718b..81e17c75bfe3cdba1712e8815990208d3c09ad19 100644
+--- a/libavcodec/hevc/hevcdec.h
++++ b/libavcodec/hevc/hevcdec.h
+@@ -71,7 +71,8 @@
+ #define SAMPLE(tab, x, y) ((tab)[(y) * s->sps->width + (x)])
+ #define SAMPLE_CTB(tab, x, y) ((tab)[(y) * min_cb_width + (x)])
+ 
+-#define IS_IDR(s) ((s)->nal_unit_type == HEVC_NAL_IDR_W_RADL || (s)->nal_unit_type == HEVC_NAL_IDR_N_LP)
++#define IS_IDR_TYPE(t) ((t) == HEVC_NAL_IDR_W_RADL || (t) == HEVC_NAL_IDR_N_LP)
++#define IS_IDR(s) IS_IDR_TYPE((s)->nal_unit_type)
+ #define IS_BLA(s) ((s)->nal_unit_type == HEVC_NAL_BLA_W_RADL || (s)->nal_unit_type == HEVC_NAL_BLA_W_LP || \
+                    (s)->nal_unit_type == HEVC_NAL_BLA_N_LP)
+ #define IS_IRAP(s) ((s)->nal_unit_type >= HEVC_NAL_BLA_W_LP && (s)->nal_unit_type <= HEVC_NAL_RSV_IRAP_VCL23)
+@@ -341,8 +342,6 @@ typedef struct TransformUnit {
+     int chroma_mode_c;
+     uint8_t is_cu_qp_delta_coded;
+     uint8_t is_cu_chroma_qp_offset_coded;
+-    int8_t  cu_qp_offset_cb;
+-    int8_t  cu_qp_offset_cr;
+     uint8_t cross_pf;
+ } TransformUnit;
+ 
+@@ -388,17 +387,47 @@ typedef struct HEVCFrame {
+     uint8_t flags;
+ } HEVCFrame;
+ 
+-typedef struct HEVCLocalContext {
+-    uint8_t cabac_state[HEVC_CONTEXTS];
++/* Decoding state of one substream in progress: one per tile column, or one
++ * per thread (i.e. per CTB row) for WPP. Only state that has to survive from
++ * one CTB to the next belongs here; the rest of HEVCLocalContext is scratch
++ * space used while a single CTB is decoded. */
++typedef struct HEVCSubstream {
++    const uint8_t *data;    ///< CABAC bytes of this substream
++    size_t         size;
++    /* When 0, CABAC is opened on data above at first use. When 1 it is
++     * already open, so at a substream boundary reading continues
++     * byte-aligned inside the same buffer (serial traversal). */
++    uint8_t        opened;
+ 
++    CABACContext cc;
++    uint8_t cabac_state[HEVC_CONTEXTS];
+     uint8_t stat_coeff[HEVC_STAT_COEFFS];
+ 
++    /* QP prediction chain: written by the previous CTB and read by the next
++     * one within the substream. */
++    int8_t  qp_y;
++    int     qPy_pred;
+     uint8_t first_qp_group;
++    int8_t  cu_qp_offset_cb;
++    int8_t  cu_qp_offset_cr;
++} HEVCSubstream;
++
++typedef struct HEVCLocalContext {
++    HEVCSubstream sub;
+ 
+     void *logctx;
+     const struct HEVCContext *parent;
+ 
+-    CABACContext cc;
++    /* State of the slice this context is currently decoding. Streams that
++     * put every tile in its own slice may be decoded interleaved within one
++     * picture, so the decoding path reads these instead of the fields in
++     * HEVCContext. They are set at the four places where a slice or a tile
++     * starts: hls_decode_entry(), hls_decode_entry_wpp(),
++     * decode_tiles_row_major(), and the fallback path that decodes deferred
++     * slices in their original order. */
++    const SliceHeader *sh;
++    const RefPicList  *rpl;             ///< reference lists of that slice, NULL for I slices
++    const HEVCFrame   *collocated_ref;  ///< picture read by the temporal MVP, NULL if none
+ 
+     /**
+      * This is a pointer to the common CABAC state.
+@@ -412,11 +441,6 @@ typedef struct HEVCLocalContext {
+      */
+     HEVCCABACState *common_cabac_state;
+ 
+-    int8_t qp_y;
+-    int8_t curr_qp_y;
+-
+-    int qPy_pred;
+-
+     TransformUnit tu;
+ 
+     uint8_t ctb_left_flag;
+@@ -487,6 +511,33 @@ typedef struct HEVCLayerContext {
+     struct AVRefStructPool *rpl_tab_pool;
+ } HEVCLayerContext;
+ 
++/* One slice kept aside to be decoded together with the others later. The
++ * slice header is a shallow copy, with the heap allocated arrays cleared so
++ * that they cannot alias the original, see defer_tile_slice(). */
++typedef struct HEVCTileSlice {
++    SliceHeader sh;
++    const uint8_t *data;
++    int size;
++    int start_ts;
++    int qp_y_seed;      ///< lc[0].qp_y before deferring, the initial QP predictor
++    const RefPicList *rpl;              ///< reference lists of this slice
++    const HEVCFrame *collocated_ref;    ///< temporal MVP target of this slice
++} HEVCTileSlice;
++
++/* Where one tile starts and which state it is decoded with. Tiles bound
++ * together in a single slice by entry points and tiles spread over one slice
++ * each are both described by this table, so the traversal code is shared. */
++typedef struct HEVCTileStream {
++    const SliceHeader *sh;  ///< header of the slice this tile belongs to
++    const RefPicList *rpl;  ///< reference lists of that slice, NULL for I slices
++    const HEVCFrame *collocated_ref;    ///< temporal MVP target of that slice
++    const uint8_t *data;    ///< start of the CABAC substream
++    size_t size;
++    int qp_y_seed;
++    int start_ts;           ///< first CTB of the tile, in tile scan order
++    int ended;              ///< the substream signalled its end (damaged input)
++} HEVCTileStream;
++
+ typedef struct HEVCContext {
+     const AVClass *c;  // needed by private avoptions
+     AVCodecContext *avctx;
+@@ -581,6 +632,32 @@ typedef struct HEVCContext {
+ 
+     AVBufferRef *rpu_buf;       ///< 0 or 1 Dolby Vision RPUs.
+     DOVIContext dovi_ctx;       ///< Dolby Vision decoding context
++
++    /* Buffer collecting the slices of one picture when every tile carries
++     * its own independent slice, so that they can be decoded together in row
++     * major order. A deferred slice remembers the frame and the layer it
++     * belongs to, so that it is dropped instead of being decoded into a
++     * foreign frame if the point where the buffer is flushed was missed. */
++    HEVCTileSlice *tile_slices;
++    unsigned nb_tile_slices;
++    unsigned tile_slices_alloc;
++    const HEVCFrame *tile_slices_frame;
++    int tile_slices_layer;
++
++    /* Per-tile substream table of the picture, one entry per tile */
++    HEVCTileStream *tile_streams;
++    unsigned tile_streams_alloc;
++
++    /* Per-tile-column substream state used by the row major traversal, one
++     * entry per column. The contents are set up again by the traversal loop
++     * for every picture, so this array only ever grows. */
++    HEVCSubstream *substreams;
++    unsigned nb_substreams;
++
++    /* Decode tiled streams in CTB row order so that frame threading keeps
++     * overlapping. -1 = auto (only with frame threading), 0 = off,
++     * 1 = forced */
++    int tile_interleave;
+ } HEVCContext;
+ 
+ /**
+@@ -608,8 +685,7 @@ int ff_hevc_slice_rpl(HEVCContext *s);
+ void ff_hevc_save_states(HEVCLocalContext *lc, const HEVCPPS *pps,
+                          int ctb_addr_ts);
+ int ff_hevc_cabac_init(HEVCLocalContext *lc, const HEVCPPS *pps,
+-                       int ctb_addr_ts, const uint8_t *data, size_t size,
+-                       int is_wpp);
++                       int ctb_addr_ts);
+ int ff_hevc_sao_merge_flag_decode(HEVCLocalContext *lc);
+ int ff_hevc_sao_type_idx_decode(HEVCLocalContext *lc);
+ int ff_hevc_sao_band_position_decode(HEVCLocalContext *lc);
+diff --git a/libavcodec/hevc/mvs.c b/libavcodec/hevc/mvs.c
+index 55f115ad0c2781538e051312e513f054f4d0f7fa..17e607f820a474e8cc8471625e935656cf9dd82f 100644
+--- a/libavcodec/hevc/mvs.c
++++ b/libavcodec/hevc/mvs.c
+@@ -161,11 +161,12 @@ static int check_mvset(Mv *mvLXCol, const Mv *mvCol,
+                 refPicList_col, L ## l, temp_col.ref_idx[l])
+ 
+ // derive the motion vectors section 8.5.3.1.8
+-static int derive_temporal_colocated_mvs(const HEVCContext *s, MvField temp_col,
++static int derive_temporal_colocated_mvs(const HEVCContext *s,
++                                         const HEVCLocalContext *lc, MvField temp_col,
+                                          int refIdxLx, Mv *mvLXCol, int X,
+                                          int colPic, const RefPicList *refPicList_col)
+ {
+-    const RefPicList *refPicList = s->cur_frame->refPicList;
++    const RefPicList *refPicList = lc->rpl;
+ 
+     if (temp_col.pred_flag == PF_INTRA)
+         return 0;
+@@ -191,7 +192,7 @@ static int derive_temporal_colocated_mvs(const HEVCContext *s, MvField temp_col,
+             else
+                 return CHECK_MVSET(1);
+         } else {
+-            if (s->sh.collocated_list == L1)
++            if (lc->sh->collocated_list == L1)
+                 return CHECK_MVSET(0);
+             else
+                 return CHECK_MVSET(1);
+@@ -209,14 +210,16 @@ static int derive_temporal_colocated_mvs(const HEVCContext *s, MvField temp_col,
+             ((y ## v) >> sps->log2_min_pu_size))
+ 
+ #define DERIVE_TEMPORAL_COLOCATED_MVS                                   \
+-    derive_temporal_colocated_mvs(s, temp_col,                          \
++    derive_temporal_colocated_mvs(s, lc, temp_col,                      \
+                                   refIdxLx, mvLXCol, X, colPic,         \
+                                   ff_hevc_get_ref_list(ref, x, y))
+ 
+ /*
+  * 8.5.3.1.7  temporal luma motion vector prediction
+  */
+-static int temporal_luma_motion_vector(const HEVCContext *s, const HEVCSPS *sps,
++static int temporal_luma_motion_vector(const HEVCContext *s,
++                                       const HEVCLocalContext *lc,
++                                       const HEVCSPS *sps,
+                                        int x0, int y0,
+                                        int nPbW, int nPbH, int refIdxLx,
+                                        Mv *mvLXCol, int X)
+@@ -228,7 +231,7 @@ static int temporal_luma_motion_vector(const HEVCContext *s, const HEVCSPS *sps,
+     int availableFlagLXCol = 0;
+     int colPic;
+ 
+-    const HEVCFrame *ref = s->collocated_ref;
++    const HEVCFrame *ref = lc->collocated_ref;
+ 
+     if (!ref) {
+         memset(mvLXCol, 0, sizeof(*mvLXCol));
+@@ -293,7 +296,7 @@ static void derive_spatial_merge_candidates(HEVCLocalContext *lc, const HEVCCont
+                                             int merge_idx,
+                                             struct MvField mergecandlist[])
+ {
+-    const RefPicList *refPicList = s->cur_frame->refPicList;
++    const RefPicList *refPicList = lc->rpl;
+     const MvField *tab_mvf       = s->cur_frame->tab_mvf;
+ 
+     const int min_pu_width = sps->min_pu_width;
+@@ -319,8 +322,8 @@ static void derive_spatial_merge_candidates(HEVCLocalContext *lc, const HEVCCont
+     const int xB2    = x0 - 1;
+     const int yB2    = y0 - 1;
+ 
+-    const int nb_refs = (s->sh.slice_type == HEVC_SLICE_P) ?
+-                        s->sh.nb_refs[0] : FFMIN(s->sh.nb_refs[0], s->sh.nb_refs[1]);
++    const int nb_refs = (lc->sh->slice_type == HEVC_SLICE_P) ?
++                        lc->sh->nb_refs[0] : FFMIN(lc->sh->nb_refs[0], lc->sh->nb_refs[1]);
+ 
+     int zero_idx = 0;
+ 
+@@ -410,13 +413,13 @@ static void derive_spatial_merge_candidates(HEVCLocalContext *lc, const HEVCCont
+     }
+ 
+     // temporal motion vector candidate
+-    if (s->sh.slice_temporal_mvp_enabled_flag &&
+-        nb_merge_cand < s->sh.max_num_merge_cand) {
++    if (lc->sh->slice_temporal_mvp_enabled_flag &&
++        nb_merge_cand < lc->sh->max_num_merge_cand) {
+         Mv mv_l0_col = { 0 }, mv_l1_col = { 0 };
+-        int available_l0 = temporal_luma_motion_vector(s, sps, x0, y0, nPbW, nPbH,
++        int available_l0 = temporal_luma_motion_vector(s, lc, sps, x0, y0, nPbW, nPbH,
+                                                        0, &mv_l0_col, 0);
+-        int available_l1 = (s->sh.slice_type == HEVC_SLICE_B) ?
+-                           temporal_luma_motion_vector(s, sps, x0, y0, nPbW, nPbH,
++        int available_l1 = (lc->sh->slice_type == HEVC_SLICE_B) ?
++                           temporal_luma_motion_vector(s, lc, sps, x0, y0, nPbW, nPbH,
+                                                        0, &mv_l1_col, 1) : 0;
+ 
+         if (available_l0 || available_l1) {
+@@ -434,11 +437,11 @@ static void derive_spatial_merge_candidates(HEVCLocalContext *lc, const HEVCCont
+     nb_orig_merge_cand = nb_merge_cand;
+ 
+     // combined bi-predictive merge candidates  (applies for B slices)
+-    if (s->sh.slice_type == HEVC_SLICE_B && nb_orig_merge_cand > 1 &&
+-        nb_orig_merge_cand < s->sh.max_num_merge_cand) {
++    if (lc->sh->slice_type == HEVC_SLICE_B && nb_orig_merge_cand > 1 &&
++        nb_orig_merge_cand < lc->sh->max_num_merge_cand) {
+         int comb_idx = 0;
+ 
+-        for (comb_idx = 0; nb_merge_cand < s->sh.max_num_merge_cand &&
++        for (comb_idx = 0; nb_merge_cand < lc->sh->max_num_merge_cand &&
+                            comb_idx < nb_orig_merge_cand * (nb_orig_merge_cand - 1); comb_idx++) {
+             int l0_cand_idx = l0_l1_cand_idx[comb_idx][0];
+             int l1_cand_idx = l0_l1_cand_idx[comb_idx][1];
+@@ -462,8 +465,8 @@ static void derive_spatial_merge_candidates(HEVCLocalContext *lc, const HEVCCont
+     }
+ 
+     // append Zero motion vector candidates
+-    while (nb_merge_cand < s->sh.max_num_merge_cand) {
+-        mergecandlist[nb_merge_cand].pred_flag    = PF_L0 + ((s->sh.slice_type == HEVC_SLICE_B) << 1);
++    while (nb_merge_cand < lc->sh->max_num_merge_cand) {
++        mergecandlist[nb_merge_cand].pred_flag    = PF_L0 + ((lc->sh->slice_type == HEVC_SLICE_B) << 1);
+         AV_ZERO32(mergecandlist[nb_merge_cand].mv + 0);
+         AV_ZERO32(mergecandlist[nb_merge_cand].mv + 1);
+         mergecandlist[nb_merge_cand].ref_idx[0]   = zero_idx < nb_refs ? zero_idx : 0;
+@@ -514,11 +517,11 @@ void ff_hevc_luma_mv_merge_mode(HEVCLocalContext *lc, const HEVCPPS *pps,
+     *mv = mergecand_list[merge_idx];
+ }
+ 
+-static av_always_inline void dist_scale(const HEVCContext *s, Mv *mv,
++static av_always_inline void dist_scale(const HEVCContext *s,
++                                        const RefPicList *refPicList, Mv *mv,
+                                         int min_pu_width, int x, int y,
+                                         int elist, int ref_idx_curr, int ref_idx)
+ {
+-    const RefPicList *refPicList = s->cur_frame->refPicList;
+     const MvField *tab_mvf       = s->cur_frame->tab_mvf;
+     int ref_pic_elist      = refPicList[elist].list[TAB_MVF(x, y).ref_idx[elist]];
+     int ref_pic_curr       = refPicList[ref_idx_curr].list[ref_idx];
+@@ -531,15 +534,14 @@ static av_always_inline void dist_scale(const HEVCContext *s, Mv *mv,
+     }
+ }
+ 
+-static int mv_mp_mode_mx(const HEVCContext *s, const HEVCSPS *sps,
++static int mv_mp_mode_mx(const HEVCContext *s, const RefPicList *refPicList,
++                         const HEVCSPS *sps,
+                          int x, int y, int pred_flag_index,
+                          Mv *mv, int ref_idx_curr, int ref_idx)
+ {
+     const MvField *tab_mvf = s->cur_frame->tab_mvf;
+     int min_pu_width = sps->min_pu_width;
+ 
+-    const RefPicList *refPicList = s->cur_frame->refPicList;
+-
+     if (((TAB_MVF(x, y).pred_flag) & (1 << pred_flag_index)) &&
+         refPicList[pred_flag_index].list[TAB_MVF(x, y).ref_idx[pred_flag_index]] == refPicList[ref_idx_curr].list[ref_idx]) {
+         *mv = TAB_MVF(x, y).mv[pred_flag_index];
+@@ -548,15 +550,14 @@ static int mv_mp_mode_mx(const HEVCContext *s, const HEVCSPS *sps,
+     return 0;
+ }
+ 
+-static int mv_mp_mode_mx_lt(const HEVCContext *s, const HEVCSPS *sps,
++static int mv_mp_mode_mx_lt(const HEVCContext *s, const RefPicList *refPicList,
++                            const HEVCSPS *sps,
+                             int x, int y, int pred_flag_index,
+                             Mv *mv, int ref_idx_curr, int ref_idx)
+ {
+     const MvField *tab_mvf = s->cur_frame->tab_mvf;
+     int min_pu_width = sps->min_pu_width;
+ 
+-    const RefPicList *refPicList = s->cur_frame->refPicList;
+-
+     if ((TAB_MVF(x, y).pred_flag) & (1 << pred_flag_index)) {
+         int currIsLongTerm     = refPicList[ref_idx_curr].isLongTerm[ref_idx];
+ 
+@@ -566,7 +567,7 @@ static int mv_mp_mode_mx_lt(const HEVCContext *s, const HEVCSPS *sps,
+         if (colIsLongTerm == currIsLongTerm) {
+             *mv = TAB_MVF(x, y).mv[pred_flag_index];
+             if (!currIsLongTerm)
+-                dist_scale(s, mv, min_pu_width, x, y,
++                dist_scale(s, refPicList, mv, min_pu_width, x, y,
+                            pred_flag_index, ref_idx_curr, ref_idx);
+             return 1;
+         }
+@@ -575,13 +576,13 @@ static int mv_mp_mode_mx_lt(const HEVCContext *s, const HEVCSPS *sps,
+ }
+ 
+ #define MP_MX(v, pred, mx)                                      \
+-    mv_mp_mode_mx(s, sps,                                       \
++    mv_mp_mode_mx(s, lc->rpl, sps,                              \
+                   (x ## v) >> sps->log2_min_pu_size,            \
+                   (y ## v) >> sps->log2_min_pu_size,            \
+                   pred, &mx, ref_idx_curr, ref_idx)
+ 
+ #define MP_MX_LT(v, pred, mx)                                   \
+-    mv_mp_mode_mx_lt(s, sps,                                    \
++    mv_mp_mode_mx_lt(s, lc->rpl, sps,                           \
+                      (x ## v) >> sps->log2_min_pu_size,         \
+                      (y ## v) >> sps->log2_min_pu_size,         \
+                      pred, &mx, ref_idx_curr, ref_idx)
+@@ -769,10 +770,10 @@ scalef:
+         mvpcand_list[numMVPCandLX++] = mxB;
+ 
+     //temporal motion vector prediction candidate
+-    if (numMVPCandLX < 2 && s->sh.slice_temporal_mvp_enabled_flag &&
++    if (numMVPCandLX < 2 && lc->sh->slice_temporal_mvp_enabled_flag &&
+         mvp_lx_flag == numMVPCandLX) {
+         Mv mv_col;
+-        int available_col = temporal_luma_motion_vector(s, sps, x0, y0, nPbW,
++        int available_col = temporal_luma_motion_vector(s, lc, sps, x0, y0, nPbW,
+                                                         nPbH, ref_idx,
+                                                         &mv_col, LX);
+         if (available_col)
+diff --git a/tests/fate/hevc.mak b/tests/fate/hevc.mak
+index 351f1889680e602c7796626fe7fe57e2ff6627b9..91cd539e4e4555ab0463e5d09022e6ad66bb8f30 100644
+--- a/tests/fate/hevc.mak
++++ b/tests/fate/hevc.mak
+@@ -314,6 +314,17 @@ FATE_HEVC-$(call FRAMECRC, MOV, HEVC) += fate-hevc-alpha
+ fate-hevc-color-reserved: CMD = framecrc -bsf:v hevc_metadata=colour_primaries=0:transfer_characteristics=0:matrix_coefficients=3 -i $(TARGET_SAMPLES)/hevc-conformance/AMP_A_Samsung_4.bit -vf scale,format=nv12 -frames:v 1
+ FATE_HEVC-$(call FRAMECRC, HEVC, HEVC, HEVC_METADATA_BSF SCALE_FILTER) += fate-hevc-color-reserved
+ 
++# The tile_interleave option is forced here because FATE runs single threaded,
++# where the default of -1 keeps the tile scan order. TILES_A_Cisco_2 exercises
++# the entry-point path; TILES_B_Cisco_1 includes one-slice-per-tile pictures
++# and mixed slice layouts, exercising deferred interleaving and fallback. The
++# output is the same as in tile scan order.
++fate-hevc-tile-row-order-entry-points: CMD = framecrc -tile_interleave 1 -i $(TARGET_SAMPLES)/hevc-conformance/TILES_A_Cisco_2.bit -pix_fmt yuv420p
++FATE_HEVC-$(call FRAMECRC, HEVC, HEVC, HEVC_PARSER) += fate-hevc-tile-row-order-entry-points
++
++fate-hevc-tile-row-order-slices: CMD = framecrc -tile_interleave 1 -i $(TARGET_SAMPLES)/hevc-conformance/TILES_B_Cisco_1.bit -pix_fmt yuv420p
++FATE_HEVC-$(call FRAMECRC, HEVC, HEVC, HEVC_PARSER) += fate-hevc-tile-row-order-slices
++
+ FATE_SAMPLES_AVCONV += $(FATE_HEVC-yes)
+ FATE_SAMPLES_FFPROBE += $(FATE_HEVC_FFPROBE-yes)
+ 
+diff --git a/tests/ref/fate/hevc-tile-row-order-entry-points b/tests/ref/fate/hevc-tile-row-order-entry-points
+new file mode 100644
+index 0000000000000000000000000000000000000000..8d0b5276e6c37fb1a7cde9be1b802f14483155fa
+--- /dev/null
++++ b/tests/ref/fate/hevc-tile-row-order-entry-points
+@@ -0,0 +1,105 @@
++#tb 0: 1/25
++#media_type 0: video
++#codec_id 0: rawvideo
++#dimensions 0: 1920x1080
++#sar 0: 0/1
++0,          0,          0,        1,  3110400, 0xfc052e85
++0,          1,          1,        1,  3110400, 0xfb49bf20
++0,          2,          2,        1,  3110400, 0x549eef2b
++0,          3,          3,        1,  3110400, 0xc3857801
++0,          4,          4,        1,  3110400, 0xb27d6aea
++0,          5,          5,        1,  3110400, 0xa52e1d58
++0,          6,          6,        1,  3110400, 0x02d348e6
++0,          7,          7,        1,  3110400, 0x45a9c47c
++0,          8,          8,        1,  3110400, 0xc308e886
++0,          9,          9,        1,  3110400, 0x43cd6ed6
++0,         10,         10,        1,  3110400, 0x29a054ce
++0,         11,         11,        1,  3110400, 0x76fbd08e
++0,         12,         12,        1,  3110400, 0x8638d5e2
++0,         13,         13,        1,  3110400, 0xfb4b7823
++0,         14,         14,        1,  3110400, 0x66185e15
++0,         15,         15,        1,  3110400, 0x82eaea0a
++0,         16,         16,        1,  3110400, 0x5895f1c6
++0,         17,         17,        1,  3110400, 0x0a28a1c7
++0,         18,         18,        1,  3110400, 0x37f2ecc8
++0,         19,         19,        1,  3110400, 0x0ad8b6c1
++0,         20,         20,        1,  3110400, 0x90300dcb
++0,         21,         21,        1,  3110400, 0x9731112d
++0,         22,         22,        1,  3110400, 0x5078ba88
++0,         23,         23,        1,  3110400, 0xdcfbacae
++0,         24,         24,        1,  3110400, 0x40769123
++0,         25,         25,        1,  3110400, 0xa09f4d29
++0,         26,         26,        1,  3110400, 0xa3749feb
++0,         27,         27,        1,  3110400, 0xb04c36ae
++0,         28,         28,        1,  3110400, 0x4d30c177
++0,         29,         29,        1,  3110400, 0xe247070a
++0,         30,         30,        1,  3110400, 0x84c669d5
++0,         31,         31,        1,  3110400, 0x3e0529e6
++0,         32,         32,        1,  3110400, 0xd0d58b7a
++0,         33,         33,        1,  3110400, 0x05de0ffa
++0,         34,         34,        1,  3110400, 0x7d10a27f
++0,         35,         35,        1,  3110400, 0x87dd43fe
++0,         36,         36,        1,  3110400, 0xc6f39e98
++0,         37,         37,        1,  3110400, 0x9bf5a18b
++0,         38,         38,        1,  3110400, 0x4880f4e6
++0,         39,         39,        1,  3110400, 0xbba7a2fd
++0,         40,         40,        1,  3110400, 0x82fe2a14
++0,         41,         41,        1,  3110400, 0x7e701e1c
++0,         42,         42,        1,  3110400, 0x23cdbc0c
++0,         43,         43,        1,  3110400, 0xf15977e6
++0,         44,         44,        1,  3110400, 0x50df6fe2
++0,         45,         45,        1,  3110400, 0x8913ddde
++0,         46,         46,        1,  3110400, 0x633c8c0e
++0,         47,         47,        1,  3110400, 0xea604347
++0,         48,         48,        1,  3110400, 0xa5049365
++0,         49,         49,        1,  3110400, 0x35da77a8
++0,         50,         50,        1,  3110400, 0xcfa4af57
++0,         51,         51,        1,  3110400, 0x5a3bfe64
++0,         52,         52,        1,  3110400, 0x91f9ee34
++0,         53,         53,        1,  3110400, 0x21b0df73
++0,         54,         54,        1,  3110400, 0x7807baf2
++0,         55,         55,        1,  3110400, 0x96dbaf03
++0,         56,         56,        1,  3110400, 0xb8d29f57
++0,         57,         57,        1,  3110400, 0x1a04f732
++0,         58,         58,        1,  3110400, 0x54a34b35
++0,         59,         59,        1,  3110400, 0x4850a07a
++0,         60,         60,        1,  3110400, 0x7010be29
++0,         61,         61,        1,  3110400, 0x7178d2e7
++0,         62,         62,        1,  3110400, 0x17483898
++0,         63,         63,        1,  3110400, 0x4c55872a
++0,         64,         64,        1,  3110400, 0xe67b0f06
++0,         65,         65,        1,  3110400, 0x958789cf
++0,         66,         66,        1,  3110400, 0x5cd6ba06
++0,         67,         67,        1,  3110400, 0xb7852fe2
++0,         68,         68,        1,  3110400, 0x8b67bd9f
++0,         69,         69,        1,  3110400, 0x9555c0ff
++0,         70,         70,        1,  3110400, 0x6b99aab7
++0,         71,         71,        1,  3110400, 0xcab904b7
++0,         72,         72,        1,  3110400, 0xeb915c25
++0,         73,         73,        1,  3110400, 0xd3066bd8
++0,         74,         74,        1,  3110400, 0xa2d45cb5
++0,         75,         75,        1,  3110400, 0x011db978
++0,         76,         76,        1,  3110400, 0xf35b9f2c
++0,         77,         77,        1,  3110400, 0x6afd3bde
++0,         78,         78,        1,  3110400, 0xa1ad77b7
++0,         79,         79,        1,  3110400, 0x8b4d3823
++0,         80,         80,        1,  3110400, 0xd806be79
++0,         81,         81,        1,  3110400, 0x29dcff87
++0,         82,         82,        1,  3110400, 0x202fb0f7
++0,         83,         83,        1,  3110400, 0xacfc7d1d
++0,         84,         84,        1,  3110400, 0xf04bdcb8
++0,         85,         85,        1,  3110400, 0x89cef288
++0,         86,         86,        1,  3110400, 0x657315e2
++0,         87,         87,        1,  3110400, 0x1615cb5f
++0,         88,         88,        1,  3110400, 0xc6986395
++0,         89,         89,        1,  3110400, 0x6b77258e
++0,         90,         90,        1,  3110400, 0xcd9975ae
++0,         91,         91,        1,  3110400, 0x5044fd0f
++0,         92,         92,        1,  3110400, 0x20dd1132
++0,         93,         93,        1,  3110400, 0xdb5a0b84
++0,         94,         94,        1,  3110400, 0xf40d29ae
++0,         95,         95,        1,  3110400, 0xe88bffed
++0,         96,         96,        1,  3110400, 0x3e50146a
++0,         97,         97,        1,  3110400, 0xaacd9bfa
++0,         98,         98,        1,  3110400, 0x270b2c2a
++0,         99,         99,        1,  3110400, 0xc727f760
+diff --git a/tests/ref/fate/hevc-tile-row-order-slices b/tests/ref/fate/hevc-tile-row-order-slices
+new file mode 100644
+index 0000000000000000000000000000000000000000..b03a9c3f80b2da67b6b3d497aa7fb0b84138895f
+--- /dev/null
++++ b/tests/ref/fate/hevc-tile-row-order-slices
+@@ -0,0 +1,105 @@
++#tb 0: 1/25
++#media_type 0: video
++#codec_id 0: rawvideo
++#dimensions 0: 1920x1080
++#sar 0: 0/1
++0,          0,          0,        1,  3110400, 0x3471f473
++0,          1,          1,        1,  3110400, 0xb371a3e8
++0,          2,          2,        1,  3110400, 0x6d83c623
++0,          3,          3,        1,  3110400, 0x62d68b96
++0,          4,          4,        1,  3110400, 0xa8ed6ea9
++0,          5,          5,        1,  3110400, 0xcabe52be
++0,          6,          6,        1,  3110400, 0xbbb23578
++0,          7,          7,        1,  3110400, 0xb1609c77
++0,          8,          8,        1,  3110400, 0x61e7c2a7
++0,          9,          9,        1,  3110400, 0x6d8b34ad
++0,         10,         10,        1,  3110400, 0xde0dfa96
++0,         11,         11,        1,  3110400, 0x48c2b0b0
++0,         12,         12,        1,  3110400, 0x647b6f90
++0,         13,         13,        1,  3110400, 0xd37f2dda
++0,         14,         14,        1,  3110400, 0x1b0dd122
++0,         15,         15,        1,  3110400, 0x0b050786
++0,         16,         16,        1,  3110400, 0xcd9ce7e5
++0,         17,         17,        1,  3110400, 0xb92a4ee4
++0,         18,         18,        1,  3110400, 0x4fa4d97c
++0,         19,         19,        1,  3110400, 0x109777eb
++0,         20,         20,        1,  3110400, 0xc3d2236a
++0,         21,         21,        1,  3110400, 0x1cd12d07
++0,         22,         22,        1,  3110400, 0xdd1ef75d
++0,         23,         23,        1,  3110400, 0xd00c0906
++0,         24,         24,        1,  3110400, 0x8de79207
++0,         25,         25,        1,  3110400, 0x18017e1e
++0,         26,         26,        1,  3110400, 0x4329f68a
++0,         27,         27,        1,  3110400, 0x6a402bae
++0,         28,         28,        1,  3110400, 0x90eb1a20
++0,         29,         29,        1,  3110400, 0xe3474876
++0,         30,         30,        1,  3110400, 0xd652e216
++0,         31,         31,        1,  3110400, 0xeb458ebb
++0,         32,         32,        1,  3110400, 0xc5aff075
++0,         33,         33,        1,  3110400, 0xcb4d72e7
++0,         34,         34,        1,  3110400, 0x5504d9c5
++0,         35,         35,        1,  3110400, 0xcd0147b4
++0,         36,         36,        1,  3110400, 0xe2f0001e
++0,         37,         37,        1,  3110400, 0xa2199fe5
++0,         38,         38,        1,  3110400, 0x2f269683
++0,         39,         39,        1,  3110400, 0x7cf11244
++0,         40,         40,        1,  3110400, 0xf39cb39d
++0,         41,         41,        1,  3110400, 0x0e195a06
++0,         42,         42,        1,  3110400, 0x195e31e3
++0,         43,         43,        1,  3110400, 0xc43cd272
++0,         44,         44,        1,  3110400, 0x9dc1c4ea
++0,         45,         45,        1,  3110400, 0x846cd55f
++0,         46,         46,        1,  3110400, 0xe9468052
++0,         47,         47,        1,  3110400, 0xc5bb38ff
++0,         48,         48,        1,  3110400, 0xd1886697
++0,         49,         49,        1,  3110400, 0x23f2012b
++0,         50,         50,        1,  3110400, 0x669d63ff
++0,         51,         51,        1,  3110400, 0xced83804
++0,         52,         52,        1,  3110400, 0x005f5f3d
++0,         53,         53,        1,  3110400, 0x772efc80
++0,         54,         54,        1,  3110400, 0x94012838
++0,         55,         55,        1,  3110400, 0x99770054
++0,         56,         56,        1,  3110400, 0x8654c655
++0,         57,         57,        1,  3110400, 0xed3d19f4
++0,         58,         58,        1,  3110400, 0x8efc2172
++0,         59,         59,        1,  3110400, 0x9aaf930d
++0,         60,         60,        1,  3110400, 0xbe32f43e
++0,         61,         61,        1,  3110400, 0x6008f53e
++0,         62,         62,        1,  3110400, 0xb87897b9
++0,         63,         63,        1,  3110400, 0xe2406eb1
++0,         64,         64,        1,  3110400, 0xbdfa067b
++0,         65,         65,        1,  3110400, 0x82a16dbd
++0,         66,         66,        1,  3110400, 0x909aa5f0
++0,         67,         67,        1,  3110400, 0xc63836b5
++0,         68,         68,        1,  3110400, 0xaf7ad199
++0,         69,         69,        1,  3110400, 0xfa010078
++0,         70,         70,        1,  3110400, 0x00c0c24e
++0,         71,         71,        1,  3110400, 0xbda7cc4e
++0,         72,         72,        1,  3110400, 0xda97f9d5
++0,         73,         73,        1,  3110400, 0xd359e94a
++0,         74,         74,        1,  3110400, 0xcd48c131
++0,         75,         75,        1,  3110400, 0xb52ca032
++0,         76,         76,        1,  3110400, 0x55a69650
++0,         77,         77,        1,  3110400, 0x7241c1a9
++0,         78,         78,        1,  3110400, 0xf06c5744
++0,         79,         79,        1,  3110400, 0xe1befd73
++0,         80,         80,        1,  3110400, 0xe8ffea92
++0,         81,         81,        1,  3110400, 0xd76e40b6
++0,         82,         82,        1,  3110400, 0xbf5f5b4c
++0,         83,         83,        1,  3110400, 0x0eb8d128
++0,         84,         84,        1,  3110400, 0x453dd680
++0,         85,         85,        1,  3110400, 0x7114fada
++0,         86,         86,        1,  3110400, 0xa3b4e7a8
++0,         87,         87,        1,  3110400, 0xbca356f0
++0,         88,         88,        1,  3110400, 0x80a83fa3
++0,         89,         89,        1,  3110400, 0x713a33d4
++0,         90,         90,        1,  3110400, 0x4fda8aea
++0,         91,         91,        1,  3110400, 0x31ed1a88
++0,         92,         92,        1,  3110400, 0x736312a0
++0,         93,         93,        1,  3110400, 0x60aff0c5
++0,         94,         94,        1,  3110400, 0xee66bd76
++0,         95,         95,        1,  3110400, 0xe8f9a352
++0,         96,         96,        1,  3110400, 0xb51520de
++0,         97,         97,        1,  3110400, 0xd0542466
++0,         98,         98,        1,  3110400, 0x92c2f3e1
++0,         99,         99,        1,  3110400, 0xbbe1839a
