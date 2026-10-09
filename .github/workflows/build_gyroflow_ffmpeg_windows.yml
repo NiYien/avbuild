@@ -26,7 +26,7 @@ env:
 
 jobs:
   windows-x64:
-    runs-on: windows-2022
+    runs-on: windows-2025-vs2026
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -72,12 +72,13 @@ jobs:
         shell: msys2 {0}
         env:
           VC_BUILD: 'true'
-          VS_CL: vs2022
+          VS_CL: vs2026
           Platform: x64
           VSLANG: '1033'
         run: |
           set -euo pipefail
           export FFSRC="$PWD/ffmpeg-8.1"
+          export PKG_CONFIG_PATH_MFX="$PWD/tools/dep/windows/x64/lib/pkgconfig"
           printf '%s\n' '8.1-niyien-hevc-tiles-v1' > "$FFSRC/FF_VERSION"
           ./avbuild.sh windows-desktop x64
 
