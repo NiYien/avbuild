@@ -42,7 +42,7 @@ jobs:
         with:
           msystem: MSYS
           path-type: inherit
-          install: make diffutils patch pkgconf nasm yasm
+          install: make diffutils patch pkgconf nasm yasm mingw-w64-x86_64-glslang
 
       - name: Prepare FFmpeg and codec dependencies
         shell: pwsh
@@ -86,6 +86,7 @@ jobs:
           VSLANG: '1033'
         run: |
           set -euo pipefail
+          export PATH="/mingw64/bin:$PATH"
           export FFSRC="$PWD/ffmpeg-8.1"
           export PKG_CONFIG_PATH_MFX="$PWD/tools/dep/windows/x64/lib/pkgconfig"
           printf '%s\n' '8.1-niyien-hevc-tiles-v1' > "$FFSRC/FF_VERSION"

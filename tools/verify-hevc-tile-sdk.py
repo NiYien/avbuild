@@ -25,6 +25,7 @@ checks['avcodec_major'] = 62
 checks['tile_interleave_available'] = True
 required = json.loads((root / 'tools/gyroflow-windows-features.json').read_text(encoding='utf-8'))
 checks['features'] = {}
+missing_features = {}
 for category, expected in required.items():
     actual = set()
     for line in output('-' + category).splitlines():
@@ -36,7 +37,11 @@ for category, expected in required.items():
             actual.update(parts[1].split(','))
     missing = sorted(set(expected) - actual)
     checks['features'][category] = dict(required=len(expected), available=len(actual), missing=missing)
-    assert not missing, (category, missing)
+    if missing:
+        missing_features[category] = missing
+Path('verification.json').write_text(json.dumps(checks, indent=2) + '\n', encoding='utf-8')
+assert not missing_features, missing_features
+assert 'vulkan' in output('-h', 'decoder=dpx'), 'DPX Vulkan decoding is missing'
 
 checks['conformance'] = []
 sample_dir = root / 'verification-samples'
