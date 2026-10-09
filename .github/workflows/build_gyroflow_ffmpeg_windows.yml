@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: gyroflow-ffmpeg-windows-hevc-tiles
@@ -45,6 +46,8 @@ jobs:
 
       - name: Prepare FFmpeg and codec dependencies
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
           git clone --depth 1 --branch n8.1 https://github.com/FFmpeg/FFmpeg.git ffmpeg-8.1
@@ -58,8 +61,10 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Failed to extract $name" }
           }
           Get-FileHash dep.7z,dep_gpl.7z -Algorithm SHA256 | Format-List | Out-File dependency-hashes.txt
-          curl.exe -fL --retry 3 --connect-timeout 30 --max-time 600 -o libmdk-dep.zip https://nightly.link/wang-bin/devpkgs/workflows/build/main/libmdk-dep.zip
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to download current hardware codec dependencies' }
+          python -c "import subprocess; f=open('libmdk-dep.zip','wb'); subprocess.run(['gh','api','repos/wang-bin/devpkgs/actions/artifacts/11416580044/zip'],stdout=f,check=True); f.close()"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download pinned hardware codec dependencies' }
+          $dependencyHash = (Get-FileHash libmdk-dep.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($dependencyHash -ne '3fbc46151bd00b451bbb6b796a02453bbb154cf16fb38759490a37091ae2fc96') { throw 'Hardware codec dependency checksum mismatch' }
           7z x -y libmdk-dep.zip -otools/dependency-overlay
           if ($LASTEXITCODE -ne 0) { throw 'Failed to extract dependency overlay' }
           7z x -y tools/dependency-overlay/dep-av.7z -otools/dependency-overlay
