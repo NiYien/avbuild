@@ -3,18 +3,19 @@ name: Build Gyroflow FFmpeg
 on:
   workflow_dispatch:
   push:
-    branches: [master]
+    branches: [codex/ffmpeg-9-custom]
 
 permissions:
   contents: read
 
 concurrency:
-  group: gyroflow-ffmpeg-8.1-macos
+  group: gyroflow-ffmpeg-9.0-macos
   cancel-in-progress: false
 
 env:
-  FF_VERSION: '8.1'
-  FF_COMMIT: 'n8.1.3'
+  FF_VERSION: '9.0'
+  FF_COMMIT: '946fcce07b6dcd0331c8cc609192aeff5e1924f8'
+  FFREPO: 'https://github.com/FFmpeg/FFmpeg.git'
   TARGET_OS: macOS
   CONFIG_SUFFIX: -gpl-lite
   NINJA_STATUS: '[%f/%t %e %r]'
@@ -44,6 +45,8 @@ jobs:
       run: |
         set -euo pipefail
         python3 tools/verify-videotoolbox-color-fix.py "ffmpeg-${FF_VERSION}"
+        sdk=$(echo sdk-*)
+        "$sdk/bin/ffmpeg" -hide_banner -h decoder=hevc 2>&1 | grep tile_interleave
 
     - name: Verify universal libraries and VideoToolbox encoders
       shell: bash

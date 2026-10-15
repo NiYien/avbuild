@@ -18,7 +18,7 @@ for field in ("color_primaries", "transfer_function", "ycbcr_matrix"):
 assert "CFRelease(vtctx->session)" in reset
 assert "CFRelease(vtctx->supported_props)" in reset
 manifest = {
-    "ffmpeg_tag": "n8.1.3",
+    "ffmpeg_tag": "n9.0.2",
     "ffmpeg_commit": subprocess.check_output(["git", "-C", str(source_root), "rev-parse", "HEAD"], text=True).strip(),
     "avbuild_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
     "patch": "videotoolbox-color-ownership-v1",
