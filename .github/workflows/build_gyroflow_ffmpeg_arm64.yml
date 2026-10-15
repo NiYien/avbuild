@@ -6,6 +6,7 @@ on:
     paths:
       - .github/workflows/build_gyroflow_ffmpeg_arm64.yml
       - tools/verify-arm64-sdk.py
+      - avbuild.sh
 permissions:
   contents: read
   actions: read

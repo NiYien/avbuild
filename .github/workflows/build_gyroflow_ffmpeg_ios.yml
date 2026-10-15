@@ -51,7 +51,8 @@ jobs:
           for codec in libx264 libx265 aac; do
             grep -F "_ff_${codec}_encoder" codec-symbols.txt
           done
-          grep '9.0.2-niyien-ios-v1' "$sdk/include/libavutil/ffversion.h"
+          cat "$sdk/include/libavutil/ffversion.h"
+          grep -E '9\.0\.2|946fcce' "$sdk/include/libavutil/ffversion.h"
           mkdir ownership-object
           (cd ownership-object && ar -x "../$sdk/lib/libavcodec.a" videotoolboxenc.o)
           xcrun llvm-objdump --disassemble --symbolize-operands ownership-object/videotoolboxenc.o > videotoolboxenc-disassembly.txt

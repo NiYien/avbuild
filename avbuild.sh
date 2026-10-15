@@ -733,7 +733,7 @@ EOF
 setup_vc_desktop_env() {
 # http://ffmpeg.org/platform.html#Microsoft-Visual-C_002b_002b-or-Intel-C_002b_002b-Compiler-for-Windows
   [ -z "$WSL_DISTRO_NAME" ] && [[ "$platform" != arm* ]] && enable_libmfx $platform # msys2: -I -libpath path starts with X:/. wsl: -libpath:X:/ is ignored
-  [ -d "$AMF_DIR" -a "${platform:0:3}" != "arm" ] && EXTRA_CFLAGS+=" -I$AMF_DIR"
+  [ -d "$AMF_DIR" ] && EXTRA_CFLAGS+=" -I$AMF_DIR"
   [ -d "$SDL2_DIR" -a "${platform:0:3}" != "arm" ] && {
     EXTRA_CFLAGS+=" -I$SDL2_DIR/include"
     EXTRA_LDFLAGS+=" -L$SDL2_DIR/lib/${platform}"
