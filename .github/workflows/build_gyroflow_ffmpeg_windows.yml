@@ -54,9 +54,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'FFmpeg checkout failed' }
           $commit = git -C ffmpeg-9.0 rev-parse HEAD
           if ($LASTEXITCODE -ne 0 -or $commit.Trim() -ne $env:FF_COMMIT) { throw 'Unexpected FFmpeg source revision' }
-          git -C tools/nv-codec-headers fetch --depth 1 origin e844e5b26f46bb77479f063029595293aa8f812d
+          git -C tools/nv-codec-headers fetch --depth 1 origin 0a6fba9a2820628b8103464f4c8753ee05838baa
           if ($LASTEXITCODE -ne 0) { throw 'NVIDIA header fetch failed' }
-          git -C tools/nv-codec-headers checkout --detach e844e5b26f46bb77479f063029595293aa8f812d
+          git -C tools/nv-codec-headers checkout --detach 0a6fba9a2820628b8103464f4c8753ee05838baa
           if ($LASTEXITCODE -ne 0) { throw 'NVIDIA header checkout failed' }
           foreach ($name in @('dep', 'dep_gpl')) {
             curl.exe -fL --retry 3 --connect-timeout 30 --max-time 600 -o "$name.7z" "https://master.dl.sourceforge.net/project/avbuild/dep/$name.7z?viasf=1"

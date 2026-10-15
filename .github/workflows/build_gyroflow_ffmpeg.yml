@@ -2,8 +2,6 @@ name: Build Gyroflow FFmpeg
 
 on:
   workflow_dispatch:
-  push:
-    branches: [codex/ffmpeg-9-custom]
 
 permissions:
   contents: read
