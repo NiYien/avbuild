@@ -56,7 +56,7 @@ jobs:
           mkdir ownership-object
           (cd ownership-object && ar -x "../$sdk/lib/libavcodec.a" videotoolboxenc.o)
           xcrun llvm-objdump --disassemble --symbolize-operands ownership-object/videotoolboxenc.o > videotoolboxenc-disassembly.txt
-          cp tools/dep_gpl/iOS/lib/* "$sdk/lib/"
+          cp -avf tools/dep_gpl/iOS/lib/* "$sdk/lib/"
           cp dependency-hashes.txt "$sdk/"
           python3 -c "import json,os,pathlib; pathlib.Path('verification.json').write_text(json.dumps(dict(ffmpeg_base=os.environ['FF_COMMIT'],architecture='arm64',platform='iOS',source_ownership_check=True,codec_symbols_checked=True,device_runtime_test=False),indent=2)+'\n')"
           cp verification.json "$sdk/"
