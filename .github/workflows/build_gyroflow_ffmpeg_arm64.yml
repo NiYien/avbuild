@@ -1,0 +1,123 @@
+name: Build Gyroflow FFmpeg Windows ARM64
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/ffmpeg-9-custom]
+    paths:
+      - .github/workflows/build_gyroflow_ffmpeg_arm64.yml
+      - tools/verify-arm64-sdk.py
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: gyroflow-ffmpeg-windows-arm64
+  cancel-in-progress: false
+env:
+  FF_VERSION: '9.0'
+  FF_COMMIT: '946fcce07b6dcd0331c8cc609192aeff5e1924f8'
+  CONFIG_SUFFIX: -gpl-lite
+  SDK_NAME: ffmpeg-9.0-windows-arm64-hevc-tiles-v1
+jobs:
+  windows-arm64:
+    runs-on: windows-11-vs2026-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          path-type: inherit
+          install: make diffutils patch pkgconf nasm yasm mingw-w64-x86_64-gcc mingw-w64-x86_64-glslang
+      - name: Prepare pinned FFmpeg and dependencies
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --depth 1 --branch n9.0.2 https://github.com/FFmpeg/FFmpeg.git ffmpeg-9.0
+          if ($LASTEXITCODE -ne 0) { throw 'FFmpeg checkout failed' }
+          $revision = git -C ffmpeg-9.0 rev-parse HEAD
+          if ($revision.Trim() -ne $env:FF_COMMIT) { throw 'Wrong FFmpeg revision' }
+          git -C tools/nv-codec-headers fetch --depth 1 origin 0a6fba9a2820628b8103464f4c8753ee05838baa
+          if ($LASTEXITCODE -ne 0) { throw 'NVIDIA headers fetch failed' }
+          git -C tools/nv-codec-headers checkout --detach 0a6fba9a2820628b8103464f4c8753ee05838baa
+          if ($LASTEXITCODE -ne 0) { throw 'NVIDIA headers checkout failed' }
+          foreach ($name in @('dep', 'dep_gpl')) {
+            curl.exe -fL --retry 3 -o "$name.7z" "https://master.dl.sourceforge.net/project/avbuild/dep/$name.7z?viasf=1"
+            if ($LASTEXITCODE -ne 0) { throw "Download failed: $name" }
+            7z x -y "$name.7z" -otools
+            if ($LASTEXITCODE -ne 0) { throw "Extract failed: $name" }
+          }
+          python -c "import subprocess; f=open('libmdk-dep.zip','wb'); subprocess.run(['gh','api','repos/wang-bin/devpkgs/actions/artifacts/11416580044/zip'],stdout=f,check=True); f.close()"
+          if ($LASTEXITCODE -ne 0) { throw 'Hardware dependency download failed' }
+          if ((Get-FileHash libmdk-dep.zip).Hash.ToLowerInvariant() -ne '3fbc46151bd00b451bbb6b796a02453bbb154cf16fb38759490a37091ae2fc96') { throw 'Hardware dependency hash mismatch' }
+          7z x -y libmdk-dep.zip -otools/dependency-overlay
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency extraction failed' }
+          7z x -y tools/dependency-overlay/dep-av.7z -otools/dependency-overlay
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency extraction failed' }
+          Copy-Item tools/dependency-overlay/dep-av/* tools/dep -Recurse -Force
+          curl.exe -fL --retry 3 -o AMF-headers.tar.gz https://github.com/GPUOpen-LibrariesAndSDKs/AMF/releases/download/v1.5.2/AMF-headers-v1.5.2.tar.gz
+          if ($LASTEXITCODE -ne 0) { throw 'AMF download failed' }
+          if ((Get-FileHash AMF-headers.tar.gz).Hash.ToLowerInvariant() -ne 'd3c12eb324edf05e214608b6a395a51dd95770ed9d45520185d6c3a206811c99') { throw 'AMF hash mismatch' }
+          tar -xf AMF-headers.tar.gz -C tools/dep/include --strip-components=1
+          if ($LASTEXITCODE -ne 0) { throw 'AMF extraction failed' }
+          Get-FileHash dep.7z,dep_gpl.7z,libmdk-dep.zip,AMF-headers.tar.gz | Format-List | Out-File dependency-hashes.txt
+          Copy-Item config-gyroflow-windows.sh config.sh
+      - name: Build ARM64 SDK
+        shell: msys2 {0}
+        env:
+          VC_BUILD: 'true'
+          VS_CL: vs2026
+          Platform: arm64
+          VSLANG: '1033'
+        run: |
+          set -euo pipefail
+          export PATH="/mingw64/bin:$PATH"
+          export FFSRC="$PWD/ffmpeg-9.0"
+          printf '%s\n' '9.0.2-niyien-hevc-tiles-arm64-v1' > "$FFSRC/FF_VERSION"
+          ./avbuild.sh windows-desktop arm64
+      - name: Verify and package ARM64 SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = (Resolve-Path .).Path
+          $sdks = @(Get-ChildItem -Directory -Filter 'sdk-*')
+          if ($sdks.Count -ne 1) { throw 'Expected one SDK' }
+          $source = $sdks[0].FullName
+          $target = [IO.Path]::GetFullPath((Join-Path $root $env:SDK_NAME))
+          if (-not $source.StartsWith($root + [IO.Path]::DirectorySeparatorChar) -or -not $target.StartsWith($root + [IO.Path]::DirectorySeparatorChar)) { throw 'SDK path escaped workspace' }
+          Move-Item -LiteralPath $source -Destination $target
+          python tools/verify-arm64-sdk.py $target
+          if ($LASTEXITCODE -ne 0) { throw 'ARM64 verification failed' }
+          Copy-Item verification.json,dependency-hashes.txt $target
+          7z a -t7z -mx=7 "$env:SDK_NAME.7z" $env:SDK_NAME
+          if ($LASTEXITCODE -ne 0) { throw 'SDK packaging failed' }
+          $hash = (Get-FileHash "$env:SDK_NAME.7z").Hash.ToLowerInvariant()
+          "$hash  $env:SDK_NAME.7z" | Set-Content SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-9.0-windows-arm64-custom
+          path: |
+            ffmpeg-9.0-windows-arm64-hevc-tiles-v1.7z
+            verification.json
+            SHA256SUMS.txt
+            dependency-hashes.txt
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ffmpeg-arm64-diagnostics
+          path: |
+            build_*/ffbuild/config.log
+            sdk-*/config*.log
+            verification.json
+          if-no-files-found: ignore

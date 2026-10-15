@@ -42,7 +42,8 @@ with __import__('os').add_dll_directory(str(sdk / 'bin')):
     finally:
         library.avcodec_free_context(ctypes.byref(context))
 checks['monolithic_tile_interleave_available'] = True
-required = json.loads((root / 'tools/gyroflow-windows-features.json').read_text(encoding='utf-8'))
+feature_manifest = Path(sys.argv[2]) if len(sys.argv) > 2 else root / 'tools/gyroflow-windows-features.json'
+required = json.loads(feature_manifest.read_text(encoding='utf-8'))
 checks['features'] = {}
 missing_features = {}
 for category, expected in required.items():

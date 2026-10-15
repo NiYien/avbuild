@@ -1,0 +1,86 @@
+name: Build Gyroflow FFmpeg iOS
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/ffmpeg-9-custom]
+    paths:
+      - .github/workflows/build_gyroflow_ffmpeg_ios.yml
+permissions:
+  contents: read
+concurrency:
+  group: gyroflow-ffmpeg-ios
+  cancel-in-progress: false
+env:
+  FF_VERSION: '9.0'
+  FF_COMMIT: '946fcce07b6dcd0331c8cc609192aeff5e1924f8'
+  FFREPO: 'https://github.com/FFmpeg/FFmpeg.git'
+  TARGET_OS: iOS
+  CONFIG_SUFFIX: -gpl-lite
+jobs:
+  ios:
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - name: Prepare build
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./tools/ci-before-build.sh
+          curl -fL --retry 3 https://master.dl.sourceforge.net/project/avbuild/dep/dep_gpl.7z?viasf=1 -o dep_gpl.7z
+          7z x -y dep_gpl.7z -otools
+          shasum -a 256 dep.7z dep_gpl.7z libmdk-dep.zip > dependency-hashes.txt
+          printf '%s\n' '9.0.2-niyien-ios-v1' > ffmpeg-9.0/FF_VERSION
+      - name: Build iOS arm64 SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          export FFSRC="$PWD/ffmpeg-9.0"
+          ./avbuild.sh iOS15.0 arm64
+      - name: Verify device libraries and ownership fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/verify-videotoolbox-color-fix.py ffmpeg-9.0
+          sdk=$(echo sdk-*)
+          test "$(lipo -archs "$sdk/lib/libavcodec.a")" = arm64
+          nm "$sdk/lib/libavcodec.a" > codec-symbols.txt
+          for codec in h264 hevc prores; do
+            grep -F "_ff_${codec}_videotoolbox_encoder" codec-symbols.txt
+          done
+          for codec in libx264 libx265 aac; do
+            grep -F "_ff_${codec}_encoder" codec-symbols.txt
+          done
+          grep '9.0.2-niyien-ios-v1' "$sdk/include/libavutil/ffversion.h"
+          mkdir ownership-object
+          (cd ownership-object && ar -x "../$sdk/lib/libavcodec.a" videotoolboxenc.o)
+          xcrun llvm-objdump --disassemble --symbolize-operands ownership-object/videotoolboxenc.o > videotoolboxenc-disassembly.txt
+          cp tools/dep_gpl/iOS/lib/* "$sdk/lib/"
+          cp dependency-hashes.txt "$sdk/"
+          python3 -c "import json,os,pathlib; pathlib.Path('verification.json').write_text(json.dumps(dict(ffmpeg_base=os.environ['FF_COMMIT'],architecture='arm64',platform='iOS',source_ownership_check=True,codec_symbols_checked=True,device_runtime_test=False),indent=2)+'\n')"
+          cp verification.json "$sdk/"
+      - name: Package SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          GITHUB_EVENT_NAME=pull_request ./tools/ci-after-build.sh
+          shasum -a 256 ffmpeg-9.0-iOS-gpl-lite.tar.xz > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-9.0-ios-custom
+          path: |
+            ffmpeg-9.0-iOS-gpl-lite.tar.xz
+            SHA256SUMS.txt
+            verification.json
+            dependency-hashes.txt
+            videotoolboxenc-disassembly.txt
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ffmpeg-ios-diagnostics
+          path: |
+            build_*/ffbuild/config.log
+            sdk-*/config*.log
+            verification.json
+          if-no-files-found: ignore
