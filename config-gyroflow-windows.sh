@@ -7,5 +7,5 @@ DEMUX_OPT="--enable-demuxer=*sub*,*ac3,*ac,*avs*,*[mj]peg*,*vc*,*web*,au,ape,ass
 MUX_OPT="--enable-muxer=*jpeg,dnxhd,fifo,flv,gif,hls,h264,hevc,image2,mov,mp4,mpegts,matroska,null,og*,pcm*,rawvideo,rt*,spdif,*pipe,*segment,webm,wav,dash,nu*"
 PROT_OPT="--enable-protocol=cache,concat*,crypto*,data,fd,*file,ftp,h*,i*,pipe,rt*,s*,t*,u*"
 FILTER_OPT="--enable-filter=drawtext,*null*,afade,*fifo,*format,*resample,aeval,atempo,pan,crop,eq*,framerate,hw*,loudnorm,scale,volume,yadif*,*movie,overlay,allrgb,allyuv,*bars,color,test*,*key,draw*,*_qsv,*_vaapi,*v4l2*"
-USER_OPT="$USER_OPT --disable-filter=scale_cuda"
+USER_OPT="$USER_OPT --enable-amf --disable-filter=scale_cuda"
 MUX_OPT="$MUX_OPT --enable-muxer=framecrc,framehash"
