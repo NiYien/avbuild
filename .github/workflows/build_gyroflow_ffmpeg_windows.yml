@@ -3,7 +3,7 @@ name: Build Gyroflow FFmpeg Windows
 on:
   workflow_dispatch:
   push:
-    branches: [codex/ffmpeg-9-custom]
+    branches: [codex/ffmpeg-9-custom, codex/prores-raw-eva1]
     paths:
       - .github/workflows/build_gyroflow_ffmpeg_windows.yml
       - patches/9.0/**
@@ -23,7 +23,7 @@ env:
   FF_VERSION: '9.0'
   FF_COMMIT: '946fcce07b6dcd0331c8cc609192aeff5e1924f8'
   CONFIG_SUFFIX: -gpl-lite
-  SDK_NAME: ffmpeg-9.0-windows-x64-hevc-tiles-v1
+  SDK_NAME: ffmpeg-9.0-windows-x64-hevc-tiles-praw-v2
 
 jobs:
   windows-x64:
@@ -95,7 +95,7 @@ jobs:
           export PATH="/mingw64/bin:$PATH"
           export FFSRC="$PWD/ffmpeg-9.0"
           export PKG_CONFIG_PATH_MFX="$PWD/tools/dep/windows/x64/lib/pkgconfig"
-          printf '%s\n' '9.0.2-niyien-hevc-tiles-v1' > "$FFSRC/FF_VERSION"
+          printf '%s\n' '9.0.2-niyien-hevc-tiles-praw-v2' > "$FFSRC/FF_VERSION"
           ./avbuild.sh windows-desktop x64
 
       - name: Verify and package SDK
@@ -113,6 +113,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'SDK verification failed' }
           Copy-Item dependency-hashes.txt,verification.json -Destination $target
           Copy-Item patches/9.0/0037-hevc-tile-row-order.patch -Destination $target
+          Copy-Item patches/9.0/0038-prores-raw-grbg.patch -Destination $target
           Copy-Item ffmpeg-9.0/COPYING.GPLv2 -Destination $target
           7z a -t7z -mx=7 "$env:SDK_NAME.7z" $env:SDK_NAME
           if ($LASTEXITCODE -ne 0) { throw 'SDK packaging failed' }
@@ -121,9 +122,9 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ffmpeg-9.0-windows-x64-hevc-tiles-v1
+          name: ffmpeg-9.0-windows-x64-hevc-tiles-praw-v2
           path: |
-            ffmpeg-9.0-windows-x64-hevc-tiles-v1.7z
+            ffmpeg-9.0-windows-x64-hevc-tiles-praw-v2.7z
             SHA256SUMS.txt
             verification.json
             dependency-hashes.txt
