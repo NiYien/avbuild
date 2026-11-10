@@ -1,0 +1,28 @@
+--- a/libavcodec/tiff.c
++++ b/libavcodec/tiff.c
+@@ -50,6 +50,10 @@
+ #include "exif_internal.h"
+ #include "faxcompr.h"
+ #include "lzw.h"
++#if defined(_M_X64)
++#include <xmmintrin.h>
++#endif
++
+ #include "tiff.h"
+ #include "tiff_common.h"
+ #include "tiff_data.h"
+@@ -300,7 +304,14 @@
+     // Color scaling
+     value_norm = ((float)value - black_level) * scale_factor;
+ 
++#if defined(_M_X64)
++    // The CRT lrintf call dominates DNG normalization on Windows. The SSE
++    // conversion follows the current rounding mode; clipping also maps
++    // invalid conversions to zero, as the CRT implementation does.
++    value = av_clip_uint16(_mm_cvtss_si32(_mm_set_ss(value_norm)));
++#else
+     value = av_clip_uint16(lrintf(value_norm));
++#endif
+ 
+     return value;
+ }

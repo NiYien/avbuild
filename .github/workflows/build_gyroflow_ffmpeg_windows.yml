@@ -9,6 +9,7 @@ on:
       - patches/9.0/**
       - tools/verify-hevc-tile-sdk.py
       - tools/verify-prores-raw-sdk.py
+      - tools/verify-tiff-rounding.py
       - tools/gyroflow-windows-features.json
       - config-gyroflow-windows.sh
 
@@ -117,6 +118,10 @@ jobs:
           Copy-Item dependency-hashes.txt,verification.json,prores-raw-verification.json -Destination $target
           Copy-Item patches/9.0/0037-hevc-tile-row-order.patch -Destination $target
           Copy-Item patches/9.0/0038-prores-raw-grbg.patch -Destination $target
+          python tools/verify-tiff-rounding.py ffmpeg-9.0 $target tiff-rounding-check
+          if ($LASTEXITCODE -ne 0) { throw 'TIFF rounding verification failed' }
+          Copy-Item tiff-rounding-check/tiff-rounding-verification.json -Destination $target
+          Copy-Item patches/9.0/0039-tiff-windows-rounding.patch -Destination $target
           Copy-Item ffmpeg-9.0/COPYING.GPLv2 -Destination $target
           7z a -t7z -mx=7 "$env:SDK_NAME.7z" $env:SDK_NAME
           if ($LASTEXITCODE -ne 0) { throw 'SDK packaging failed' }
