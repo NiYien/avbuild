@@ -3,11 +3,12 @@ name: Build Gyroflow FFmpeg Windows
 on:
   workflow_dispatch:
   push:
-    branches: [codex/ffmpeg-9-custom, codex/prores-raw-eva1]
+    branches: [codex/ffmpeg-9-custom]
     paths:
       - .github/workflows/build_gyroflow_ffmpeg_windows.yml
       - patches/9.0/**
       - tools/verify-hevc-tile-sdk.py
+      - tools/verify-prores-raw-sdk.py
       - tools/gyroflow-windows-features.json
       - config-gyroflow-windows.sh
 
@@ -111,7 +112,9 @@ jobs:
           Move-Item -LiteralPath $source -Destination $target
           python tools/verify-hevc-tile-sdk.py $target
           if ($LASTEXITCODE -ne 0) { throw 'SDK verification failed' }
-          Copy-Item dependency-hashes.txt,verification.json -Destination $target
+          python tools/verify-prores-raw-sdk.py $target
+          if ($LASTEXITCODE -ne 0) { throw 'ProRes RAW verification failed' }
+          Copy-Item dependency-hashes.txt,verification.json,prores-raw-verification.json -Destination $target
           Copy-Item patches/9.0/0037-hevc-tile-row-order.patch -Destination $target
           Copy-Item patches/9.0/0038-prores-raw-grbg.patch -Destination $target
           Copy-Item ffmpeg-9.0/COPYING.GPLv2 -Destination $target
@@ -127,6 +130,7 @@ jobs:
             ffmpeg-9.0-windows-x64-hevc-tiles-praw-v2.7z
             SHA256SUMS.txt
             verification.json
+            prores-raw-verification.json
             dependency-hashes.txt
           if-no-files-found: error
           retention-days: 30
